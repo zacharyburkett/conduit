@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -124,6 +125,14 @@ typedef struct trace_capture_state {
     int transport_send_count;
     int transport_poll_count;
 } trace_capture_state_t;
+
+typedef struct publish_thread_args {
+    cd_bus_t *bus;
+    cd_topic_t topic;
+    cd_endpoint_id_t source_endpoint;
+    int messages;
+    int failures;
+} publish_thread_args_t;
 
 static void close_fd_if_open(int *fd)
 {
@@ -815,6 +824,39 @@ static void trace_capture_handler(void *user_data, const cd_trace_event_t *event
     }
 }
 
+static void *publish_thread_main(void *arg)
+{
+    publish_thread_args_t *thread_args;
+    int i;
+
+    thread_args = (publish_thread_args_t *)arg;
+    if (thread_args == NULL || thread_args->bus == NULL || thread_args->messages <= 0) {
+        return NULL;
+    }
+
+    for (i = 0; i < thread_args->messages; ++i) {
+        cd_publish_params_t publish;
+        uint64_t payload_value;
+        cd_status_t status;
+
+        memset(&publish, 0, sizeof(publish));
+        payload_value = (uint64_t)i;
+        publish.source_endpoint = thread_args->source_endpoint;
+        publish.topic = thread_args->topic;
+        publish.flags = CD_MESSAGE_FLAG_LOCAL_ONLY;
+        publish.payload = &payload_value;
+        publish.payload_size = sizeof(payload_value);
+
+        status = cd_publish(thread_args->bus, &publish, NULL);
+        if (status != CD_STATUS_OK) {
+            thread_args->failures += 1;
+            return NULL;
+        }
+    }
+
+    return NULL;
+}
+
 static cd_status_t request_replier_handler(void *user_data, const cd_envelope_t *message)
 {
     request_replier_state_t *state;
@@ -1371,6 +1413,63 @@ static int test_trace_hook_reports_core_events(void)
     ASSERT_STATUS(cd_publish(runtime.bus, &publish, NULL), CD_STATUS_OK);
     ASSERT_STATUS(cd_bus_pump(runtime.bus, 0u, &processed), CD_STATUS_OK);
     ASSERT_TRUE(trace_state.total == total_before_disable);
+
+    teardown_runtime(&runtime);
+    return 0;
+}
+
+static int test_threadsafe_multi_producer_publish(void)
+{
+    enum {
+        THREAD_COUNT = 4,
+        MESSAGES_PER_THREAD = 1500
+    };
+
+    test_runtime_t runtime;
+    capture_state_t capture;
+    handler_state_t handler;
+    cd_subscription_desc_t sub;
+    pthread_t threads[THREAD_COUNT];
+    publish_thread_args_t thread_args[THREAD_COUNT];
+    int i;
+    size_t processed;
+
+    ASSERT_TRUE(setup_runtime(32768u, 8u, &runtime) == 0);
+
+    memset(&capture, 0, sizeof(capture));
+    memset(&handler, 0, sizeof(handler));
+    handler.capture = &capture;
+    handler.marker = 1;
+    handler.return_status = CD_STATUS_OK;
+
+    memset(&sub, 0, sizeof(sub));
+    sub.endpoint = 222u;
+    sub.topic = 9100u;
+    sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_EVENT);
+    sub.handler = generic_handler;
+    sub.user_data = &handler;
+    ASSERT_STATUS(cd_subscribe(runtime.bus, &sub, NULL), CD_STATUS_OK);
+
+    memset(threads, 0, sizeof(threads));
+    memset(thread_args, 0, sizeof(thread_args));
+    for (i = 0; i < THREAD_COUNT; ++i) {
+        thread_args[i].bus = runtime.bus;
+        thread_args[i].topic = 9100u;
+        thread_args[i].source_endpoint = (cd_endpoint_id_t)(300u + (unsigned)i);
+        thread_args[i].messages = MESSAGES_PER_THREAD;
+        thread_args[i].failures = 0;
+        ASSERT_TRUE(pthread_create(&threads[i], NULL, publish_thread_main, &thread_args[i]) == 0);
+    }
+
+    for (i = 0; i < THREAD_COUNT; ++i) {
+        ASSERT_TRUE(pthread_join(threads[i], NULL) == 0);
+        ASSERT_TRUE(thread_args[i].failures == 0);
+    }
+
+    processed = 0u;
+    ASSERT_STATUS(cd_bus_pump(runtime.bus, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(processed == (size_t)(THREAD_COUNT * MESSAGES_PER_THREAD));
+    ASSERT_TRUE(capture.count == (THREAD_COUNT * MESSAGES_PER_THREAD));
 
     teardown_runtime(&runtime);
     return 0;
@@ -3799,6 +3898,7 @@ int main(void)
     RUN_TEST(test_subscription_capacity_and_validation);
     RUN_TEST(test_pump_returns_first_callback_error);
     RUN_TEST(test_trace_hook_reports_core_events);
+    RUN_TEST(test_threadsafe_multi_producer_publish);
     RUN_TEST(test_request_reply_roundtrip_and_dispose);
     RUN_TEST(test_request_timeout_with_fake_clock);
     RUN_TEST(test_request_inflight_capacity_and_validation);

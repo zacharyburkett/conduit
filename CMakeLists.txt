@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(conduit VERSION 0.1.0 LANGUAGES C)
 
 include(GNUInstallDirs)
+find_package(Threads REQUIRED)
 
 option(CONDUIT_BUILD_TESTS "Build conduit tests" ON)
 option(CONDUIT_BUILD_SAMPLES "Build conduit sample apps" ON)
@@ -9,6 +10,7 @@ option(CONDUIT_BUILD_SAMPLES "Build conduit sample apps" ON)
 add_library(conduit
     src/core.c
     src/context.c
+    src/sync.c
     src/bus.c
     src/transport_ipc.c
     src/transport_ipc_socket.c
@@ -17,6 +19,7 @@ add_library(conduit
 add_library(conduit::conduit ALIAS conduit)
 
 target_compile_features(conduit PUBLIC c_std_11)
+target_link_libraries(conduit PUBLIC Threads::Threads)
 target_include_directories(conduit
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

@@ -125,7 +125,7 @@ Optional later optimization:
 
 MVP:
 - Single-threaded dispatch core for determinism.
-- Thread-safe publish via per-thread inbound mailbox (lock or SPSC queue).
+- Thread-safe bus APIs via internal recursive mutex (current implementation).
 
 Later:
 - MPSC queue optimization for worker threads.

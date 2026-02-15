@@ -176,6 +176,12 @@ Status:
   - app trace modes:
     - broker `--trace` (routing trace lines)
     - loadgen `--trace` (per-bus trace lines via hook API)
+- Thread-safety baseline added (no SDL dependency):
+  - internal platform mutex abstraction (`src/sync.c`)
+  - recursive lock around bus APIs for concurrent ingress safety
+  - lifecycle caveat documented: destroy must not race with API calls
+  - multithreaded producer test added:
+    - `tests/test_main.c` (`test_threadsafe_multi_producer_publish`)
 
 ## Test Matrix
 

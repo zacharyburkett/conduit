@@ -10,6 +10,20 @@ enum {
     CD_DEFAULT_TRANSPORT_CAPACITY = 8
 };
 
+static void bus_lock(cd_bus_t *bus)
+{
+    if (bus != NULL && bus->lock != NULL) {
+        cd_mutex_lock(bus->lock);
+    }
+}
+
+static void bus_unlock(cd_bus_t *bus)
+{
+    if (bus != NULL && bus->lock != NULL) {
+        cd_mutex_unlock(bus->lock);
+    }
+}
+
 static void emit_trace_event(cd_bus_t *bus, const cd_trace_event_t *event)
 {
     if (bus == NULL || event == NULL || bus->trace_hook == NULL) {
@@ -661,9 +675,14 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
     bus->next_subscription_id = 1u;
     bus->next_message_id = 1u;
     bus->next_request_token = 1u;
+    if (cd_mutex_create(context, &bus->lock) != CD_STATUS_OK) {
+        cd_context_free(context, bus);
+        return CD_STATUS_ALLOCATION_FAILED;
+    }
 
     bus->queue = (cd_queued_message_t *)cd_context_alloc(context, queue_alloc_size);
     if (bus->queue == NULL) {
+        cd_mutex_destroy(context, bus->lock);
         cd_context_free(context, bus);
         return CD_STATUS_ALLOCATION_FAILED;
     }
@@ -671,6 +690,7 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
 
     bus->subscriptions = (cd_subscription_entry_t *)cd_context_alloc(context, subscription_alloc_size);
     if (bus->subscriptions == NULL) {
+        cd_mutex_destroy(context, bus->lock);
         cd_context_free(context, bus->queue);
         cd_context_free(context, bus);
         return CD_STATUS_ALLOCATION_FAILED;
@@ -679,6 +699,7 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
 
     bus->dispatch_targets = (cd_dispatch_target_t *)cd_context_alloc(context, dispatch_target_alloc_size);
     if (bus->dispatch_targets == NULL) {
+        cd_mutex_destroy(context, bus->lock);
         cd_context_free(context, bus->subscriptions);
         cd_context_free(context, bus->queue);
         cd_context_free(context, bus);
@@ -688,6 +709,7 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
 
     bus->inflight_requests = (cd_inflight_request_t *)cd_context_alloc(context, inflight_request_alloc_size);
     if (bus->inflight_requests == NULL) {
+        cd_mutex_destroy(context, bus->lock);
         cd_context_free(context, bus->dispatch_targets);
         cd_context_free(context, bus->subscriptions);
         cd_context_free(context, bus->queue);
@@ -698,6 +720,7 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
 
     bus->transports = (cd_transport_t **)cd_context_alloc(context, transport_alloc_size);
     if (bus->transports == NULL) {
+        cd_mutex_destroy(context, bus->lock);
         cd_context_free(context, bus->inflight_requests);
         cd_context_free(context, bus->dispatch_targets);
         cd_context_free(context, bus->subscriptions);
@@ -714,10 +737,14 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
 void cd_bus_destroy(cd_bus_t *bus)
 {
     size_t i;
+    cd_context_t *context;
+    cd_mutex_t *lock;
 
     if (bus == NULL) {
         return;
     }
+    context = bus->context;
+    lock = bus->lock;
 
     for (i = 0; i < bus->queue_capacity; ++i) {
         if (bus->queue[i].payload_copy != NULL) {
@@ -732,12 +759,13 @@ void cd_bus_destroy(cd_bus_t *bus)
         }
     }
 
-    cd_context_free(bus->context, bus->inflight_requests);
-    cd_context_free(bus->context, bus->transports);
-    cd_context_free(bus->context, bus->queue);
-    cd_context_free(bus->context, bus->subscriptions);
-    cd_context_free(bus->context, bus->dispatch_targets);
-    cd_context_free(bus->context, bus);
+    cd_context_free(context, bus->inflight_requests);
+    cd_context_free(context, bus->transports);
+    cd_context_free(context, bus->queue);
+    cd_context_free(context, bus->subscriptions);
+    cd_context_free(context, bus->dispatch_targets);
+    cd_mutex_destroy(context, lock);
+    cd_context_free(context, bus);
 }
 
 void cd_bus_set_trace_hook(cd_bus_t *bus, cd_trace_hook_fn trace_hook, void *trace_user_data)
@@ -745,51 +773,62 @@ void cd_bus_set_trace_hook(cd_bus_t *bus, cd_trace_hook_fn trace_hook, void *tra
     if (bus == NULL) {
         return;
     }
-
+    bus_lock(bus);
     bus->trace_hook = trace_hook;
     bus->trace_user_data = trace_user_data;
+    bus_unlock(bus);
 }
 
 cd_status_t cd_bus_attach_transport(cd_bus_t *bus, cd_transport_t *transport)
 {
     size_t i;
+    cd_status_t status;
 
     if (bus == NULL || transport == NULL || transport->send == NULL || transport->poll == NULL) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
+    bus_lock(bus);
+    status = CD_STATUS_CAPACITY_REACHED;
 
     for (i = 0; i < bus->transport_capacity; ++i) {
         if (bus->transports[i] == transport) {
-            return CD_STATUS_INVALID_ARGUMENT;
+            status = CD_STATUS_INVALID_ARGUMENT;
+            bus_unlock(bus);
+            return status;
         }
     }
 
     for (i = 0; i < bus->transport_capacity; ++i) {
         if (bus->transports[i] == NULL) {
             bus->transports[i] = transport;
-            return CD_STATUS_OK;
+            status = CD_STATUS_OK;
+            break;
         }
     }
-
-    return CD_STATUS_CAPACITY_REACHED;
+    bus_unlock(bus);
+    return status;
 }
 
 cd_status_t cd_bus_detach_transport(cd_bus_t *bus, cd_transport_t *transport)
 {
     size_t i;
+    cd_status_t status;
 
     if (bus == NULL || transport == NULL) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
+    bus_lock(bus);
+    status = CD_STATUS_NOT_FOUND;
 
     for (i = 0; i < bus->transport_capacity; ++i) {
         if (bus->transports[i] == transport) {
             bus->transports[i] = NULL;
-            return CD_STATUS_OK;
+            status = CD_STATUS_OK;
+            break;
         }
     }
-
-    return CD_STATUS_NOT_FOUND;
+    bus_unlock(bus);
+    return status;
 }
 
 static cd_status_t receive_from_transport(void *user_data, const cd_envelope_t *message)
@@ -882,6 +921,7 @@ cd_status_t cd_bus_pump(cd_bus_t *bus, size_t max_messages, size_t *out_processe
     if (bus == NULL) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
+    bus_lock(bus);
 
     update_inflight_timeouts(bus);
     dispatch_status = CD_STATUS_OK;
@@ -962,21 +1002,23 @@ cd_status_t cd_bus_pump(cd_bus_t *bus, size_t max_messages, size_t *out_processe
     if (out_processed != NULL) {
         *out_processed = processed;
     }
-
+    bus_unlock(bus);
     return dispatch_status;
 }
 
 cd_status_t cd_publish(cd_bus_t *bus, const cd_publish_params_t *params, cd_message_id_t *out_message_id)
 {
+    cd_status_t status;
+
     if (out_message_id != NULL) {
         *out_message_id = 0;
     }
 
-    if (params == NULL) {
+    if (bus == NULL || params == NULL) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
-
-    return enqueue_message(
+    bus_lock(bus);
+    status = enqueue_message(
         bus,
         CD_MESSAGE_EVENT,
         0u,
@@ -994,6 +1036,8 @@ cd_status_t cd_publish(cd_bus_t *bus, const cd_publish_params_t *params, cd_mess
         params->payload_size,
         out_message_id
     );
+    bus_unlock(bus);
+    return status;
 }
 
 cd_status_t cd_send_command(
@@ -1002,15 +1046,17 @@ cd_status_t cd_send_command(
     cd_message_id_t *out_message_id
 )
 {
+    cd_status_t status;
+
     if (out_message_id != NULL) {
         *out_message_id = 0;
     }
 
-    if (params == NULL || params->target_endpoint == CD_ENDPOINT_NONE) {
+    if (bus == NULL || params == NULL || params->target_endpoint == CD_ENDPOINT_NONE) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
-
-    return enqueue_message(
+    bus_lock(bus);
+    status = enqueue_message(
         bus,
         CD_MESSAGE_COMMAND,
         0u,
@@ -1028,6 +1074,8 @@ cd_status_t cd_send_command(
         params->payload_size,
         out_message_id
     );
+    bus_unlock(bus);
+    return status;
 }
 
 cd_status_t cd_request_async(
@@ -1050,10 +1098,12 @@ cd_status_t cd_request_async(
         (params->payload_size > 0u && params->payload == NULL)) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
+    bus_lock(bus);
 
     update_inflight_timeouts(bus);
     request_slot = find_free_inflight_request(bus);
     if (request_slot == NULL) {
+        bus_unlock(bus);
         return CD_STATUS_CAPACITY_REACHED;
     }
 
@@ -1077,6 +1127,7 @@ cd_status_t cd_request_async(
         &request_message_id
     );
     if (enqueue_status != CD_STATUS_OK) {
+        bus_unlock(bus);
         return enqueue_status;
     }
 
@@ -1090,6 +1141,7 @@ cd_status_t cd_request_async(
     request_slot->expires_at_ns = deadline_from_timeout(now_ns, params->timeout_ns);
 
     *out_token = request_slot->token;
+    bus_unlock(bus);
     return CD_STATUS_OK;
 }
 
@@ -1099,6 +1151,8 @@ cd_status_t cd_send_reply(
     cd_message_id_t *out_message_id
 )
 {
+    cd_status_t status;
+
     if (out_message_id != NULL) {
         *out_message_id = 0u;
     }
@@ -1107,8 +1161,8 @@ cd_status_t cd_send_reply(
         params->correlation_id == 0u || (params->payload_size > 0u && params->payload == NULL)) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
-
-    return enqueue_message(
+    bus_lock(bus);
+    status = enqueue_message(
         bus,
         CD_MESSAGE_REPLY,
         params->correlation_id,
@@ -1126,6 +1180,8 @@ cd_status_t cd_send_reply(
         params->payload_size,
         out_message_id
     );
+    bus_unlock(bus);
+    return status;
 }
 
 cd_status_t cd_poll_reply(
@@ -1147,14 +1203,17 @@ cd_status_t cd_poll_reply(
     if (bus == NULL || token == 0u) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
+    bus_lock(bus);
 
     update_inflight_timeouts(bus);
     request = find_inflight_request_by_token(bus, token);
     if (request == NULL) {
+        bus_unlock(bus);
         return CD_STATUS_NOT_FOUND;
     }
 
     if (request->state == CD_REQUEST_WAITING) {
+        bus_unlock(bus);
         return CD_STATUS_OK;
     }
 
@@ -1164,6 +1223,7 @@ cd_status_t cd_poll_reply(
 
     if (request->state == CD_REQUEST_TIMED_OUT) {
         clear_inflight_request(bus, request);
+        bus_unlock(bus);
         return CD_STATUS_TIMEOUT;
     }
 
@@ -1178,6 +1238,7 @@ cd_status_t cd_poll_reply(
     }
 
     clear_inflight_request(bus, request);
+    bus_unlock(bus);
     return CD_STATUS_OK;
 }
 
@@ -1186,11 +1247,13 @@ void cd_reply_dispose(cd_bus_t *bus, cd_reply_t *reply)
     if (bus == NULL || reply == NULL) {
         return;
     }
+    bus_lock(bus);
 
     if (reply->payload != NULL) {
         cd_context_free(bus->context, (void *)reply->payload);
     }
     memset(reply, 0, sizeof(*reply));
+    bus_unlock(bus);
 }
 
 cd_status_t cd_subscribe(
@@ -1201,6 +1264,7 @@ cd_status_t cd_subscribe(
 {
     size_t i;
     uint32_t directed_message_mask;
+    cd_status_t status;
 
     if (out_subscription_id != NULL) {
         *out_subscription_id = 0;
@@ -1209,11 +1273,14 @@ cd_status_t cd_subscribe(
     if (bus == NULL || desc == NULL || desc->handler == NULL || !kind_mask_valid(desc->kind_mask)) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
+    bus_lock(bus);
+    status = CD_STATUS_CAPACITY_REACHED;
 
     directed_message_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_COMMAND) |
                             CD_MESSAGE_KIND_MASK(CD_MESSAGE_REQUEST) |
                             CD_MESSAGE_KIND_MASK(CD_MESSAGE_REPLY);
     if (desc->endpoint == CD_ENDPOINT_NONE && (desc->kind_mask & directed_message_mask) != 0u) {
+        bus_unlock(bus);
         return CD_STATUS_INVALID_ARGUMENT;
     }
 
@@ -1235,19 +1302,23 @@ cd_status_t cd_subscribe(
         if (out_subscription_id != NULL) {
             *out_subscription_id = entry->subscription_id;
         }
-        return CD_STATUS_OK;
+        status = CD_STATUS_OK;
+        break;
     }
-
-    return CD_STATUS_CAPACITY_REACHED;
+    bus_unlock(bus);
+    return status;
 }
 
 cd_status_t cd_unsubscribe(cd_bus_t *bus, cd_subscription_id_t subscription_id)
 {
     size_t i;
+    cd_status_t status;
 
     if (bus == NULL || subscription_id == 0u) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
+    bus_lock(bus);
+    status = CD_STATUS_NOT_FOUND;
 
     for (i = 0; i < bus->subscription_capacity; ++i) {
         cd_subscription_entry_t *entry;
@@ -1258,8 +1329,9 @@ cd_status_t cd_unsubscribe(cd_bus_t *bus, cd_subscription_id_t subscription_id)
         }
 
         memset(entry, 0, sizeof(*entry));
-        return CD_STATUS_OK;
+        status = CD_STATUS_OK;
+        break;
     }
-
-    return CD_STATUS_NOT_FOUND;
+    bus_unlock(bus);
+    return status;
 }

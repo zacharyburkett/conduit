@@ -13,6 +13,7 @@ It is designed to support two modes without changing module-level message logic:
 - Delivery plan: `docs/PROJECT_PLAN.md`
 - API contract: `docs/API_CONTRACT.md`
 - Topic catalog: `docs/TOPIC_CATALOG.md`
+- Threading contract: `docs/THREADING.md`
 
 ## Build
 

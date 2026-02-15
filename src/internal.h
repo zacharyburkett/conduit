@@ -50,8 +50,11 @@ typedef struct cd_inflight_request {
     size_t reply_payload_size;
 } cd_inflight_request_t;
 
+typedef struct cd_mutex cd_mutex_t;
+
 struct cd_bus {
     cd_context_t *context;
+    cd_mutex_t *lock;
     cd_queued_message_t *queue;
     size_t queue_capacity;
     size_t queue_head;
@@ -69,6 +72,11 @@ struct cd_bus {
     cd_message_id_t next_message_id;
     cd_request_token_t next_request_token;
 };
+
+cd_status_t cd_mutex_create(cd_context_t *context, cd_mutex_t **out_mutex);
+void cd_mutex_destroy(cd_context_t *context, cd_mutex_t *mutex);
+void cd_mutex_lock(cd_mutex_t *mutex);
+void cd_mutex_unlock(cd_mutex_t *mutex);
 
 void *cd_context_alloc(cd_context_t *context, size_t size);
 void cd_context_free(cd_context_t *context, void *ptr);

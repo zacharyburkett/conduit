@@ -4,9 +4,13 @@ This document freezes the initial API behavior and ownership rules for the scaff
 
 ## Threading Model
 
-- Current implementation is single-threaded at bus dispatch.
-- `cd_bus_pump` must be called from one thread at a time.
-- Concurrent publish/subscribe is not yet guaranteed thread-safe.
+- Bus internals are protected by an internal recursive mutex.
+- Bus APIs are thread-safe for concurrent calls, except destroy lifecycle:
+  - `cd_bus_destroy` must not race with other bus API calls.
+- `cd_bus_pump` remains single-consumer dispatch semantics:
+  - one pump execution at a time
+  - callbacks run on the calling thread
+  - reentrant callback publish/request/reply is supported
 
 ## Memory Ownership
 
