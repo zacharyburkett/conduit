@@ -54,6 +54,20 @@ Optional flags:
 - `--max-endpoint-routes <n>`
 - `--metrics-interval-ms <n>`
 - `--run-ms <n>`
+- `--routes-file <path>`
+
+Route file format:
+
+```txt
+topic <topic_id> <endpoint_id> [endpoint_id...]
+```
+
+Example:
+
+```txt
+topic 3501 901
+topic 0x00020001 20 21
+```
 
 ## Transport Layer (Phase 4 Start)
 

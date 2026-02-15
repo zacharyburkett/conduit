@@ -18,11 +18,13 @@ enum {
     CD_BROKER_DEFAULT_MAX_CLIENTS = 8,
     CD_BROKER_DEFAULT_MAX_TOPIC_ROUTES = 256,
     CD_BROKER_DEFAULT_MAX_ENDPOINT_ROUTES = 512,
-    CD_BROKER_DEFAULT_METRICS_INTERVAL_MS = 1000u
+    CD_BROKER_DEFAULT_METRICS_INTERVAL_MS = 1000u,
+    CD_BROKER_MAX_TOPIC_ENDPOINTS = 32
 };
 
 typedef struct broker_config {
     const char *socket_path;
+    const char *routes_file;
     size_t max_clients;
     size_t max_topic_routes;
     size_t max_endpoint_routes;
@@ -39,6 +41,9 @@ typedef struct broker_topic_route {
     bool in_use;
     cd_topic_t topic;
     uint64_t recipient_mask;
+    bool has_configured_endpoints;
+    cd_endpoint_id_t configured_endpoints[CD_BROKER_MAX_TOPIC_ENDPOINTS];
+    size_t configured_endpoint_count;
 } broker_topic_route_t;
 
 typedef struct broker_endpoint_route {
@@ -63,6 +68,7 @@ typedef struct broker_state {
     size_t topic_route_capacity;
     broker_endpoint_route_t *endpoint_routes;
     size_t endpoint_route_capacity;
+    bool explicit_topic_routes_only;
     broker_metrics_t metrics;
 } broker_state_t;
 
@@ -120,6 +126,26 @@ static bool parse_u64_arg(const char *text, uint64_t *out_value)
     return true;
 }
 
+static bool parse_u64_token(const char *text, uint64_t *out_value)
+{
+    unsigned long long value;
+    char *end_ptr;
+
+    if (text == NULL || out_value == NULL) {
+        return false;
+    }
+
+    errno = 0;
+    end_ptr = NULL;
+    value = strtoull(text, &end_ptr, 0);
+    if (errno != 0 || end_ptr == text || end_ptr == NULL || *end_ptr != '\0') {
+        return false;
+    }
+
+    *out_value = (uint64_t)value;
+    return true;
+}
+
 static void print_usage(const char *program_name)
 {
     printf(
@@ -129,6 +155,7 @@ static void print_usage(const char *program_name)
         "  --max-topic-routes <n>     default %u\n"
         "  --max-endpoint-routes <n>  default %u\n"
         "  --metrics-interval-ms <n>  default %u (0 disables periodic print)\n"
+        "  --routes-file <path>       explicit topic route config\n"
         "  --run-ms <n>               stop after n milliseconds (0 = run until signal)\n"
         "  --help\n",
         program_name,
@@ -197,6 +224,8 @@ static bool parse_args(int argc, char **argv, broker_config_t *out_config)
                 return false;
             }
             config.metrics_interval_ms = value;
+        } else if (strcmp(arg, "--routes-file") == 0) {
+            config.routes_file = argv[i + 1];
         } else if (strcmp(arg, "--run-ms") == 0) {
             if (!parse_u64_arg(argv[i + 1], &value)) {
                 fprintf(stderr, "Invalid --run-ms value: %s\n", argv[i + 1]);
@@ -389,6 +418,120 @@ static broker_topic_route_t *find_topic_route(
     return NULL;
 }
 
+static bool load_routes_file(broker_state_t *state, const char *routes_file)
+{
+    FILE *file;
+    char line[1024];
+    unsigned line_number;
+
+    if (state == NULL || routes_file == NULL || routes_file[0] == '\0') {
+        return false;
+    }
+
+    file = fopen(routes_file, "r");
+    if (file == NULL) {
+        fprintf(stderr, "Broker could not open routes file: %s\n", routes_file);
+        return false;
+    }
+
+    line_number = 0u;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        char *save_ptr;
+        char *token;
+        char *topic_token;
+        broker_topic_route_t *route;
+        uint64_t topic_u64;
+
+        line_number += 1u;
+        save_ptr = NULL;
+        token = strtok_r(line, " \t\r\n", &save_ptr);
+        if (token == NULL || token[0] == '#') {
+            continue;
+        }
+
+        if (strcmp(token, "topic") != 0) {
+            fprintf(
+                stderr,
+                "Broker routes file parse error at line %u: expected 'topic'\n",
+                line_number
+            );
+            fclose(file);
+            return false;
+        }
+
+        topic_token = strtok_r(NULL, " \t\r\n", &save_ptr);
+        if (topic_token == NULL || !parse_u64_token(topic_token, &topic_u64) ||
+            topic_u64 > (uint64_t)UINT32_MAX) {
+            fprintf(
+                stderr,
+                "Broker routes file parse error at line %u: invalid topic id\n",
+                line_number
+            );
+            fclose(file);
+            return false;
+        }
+
+        route = find_topic_route(state, (cd_topic_t)topic_u64, true);
+        if (route == NULL) {
+            fprintf(
+                stderr,
+                "Broker routes file parse error at line %u: topic capacity reached\n",
+                line_number
+            );
+            fclose(file);
+            return false;
+        }
+        route->has_configured_endpoints = true;
+        route->configured_endpoint_count = 0u;
+
+        while (true) {
+            uint64_t endpoint_u64;
+            char *endpoint_token;
+
+            endpoint_token = strtok_r(NULL, " \t\r\n", &save_ptr);
+            if (endpoint_token == NULL) {
+                break;
+            }
+            if (!parse_u64_token(endpoint_token, &endpoint_u64) ||
+                endpoint_u64 == 0u || endpoint_u64 > (uint64_t)UINT32_MAX) {
+                fprintf(
+                    stderr,
+                    "Broker routes file parse error at line %u: invalid endpoint id\n",
+                    line_number
+                );
+                fclose(file);
+                return false;
+            }
+            if (route->configured_endpoint_count >= CD_BROKER_MAX_TOPIC_ENDPOINTS) {
+                fprintf(
+                    stderr,
+                    "Broker routes file parse error at line %u: too many topic endpoints\n",
+                    line_number
+                );
+                fclose(file);
+                return false;
+            }
+
+            route->configured_endpoints[route->configured_endpoint_count] =
+                (cd_endpoint_id_t)endpoint_u64;
+            route->configured_endpoint_count += 1u;
+        }
+
+        if (route->configured_endpoint_count == 0u) {
+            fprintf(
+                stderr,
+                "Broker routes file parse error at line %u: topic needs at least one endpoint\n",
+                line_number
+            );
+            fclose(file);
+            return false;
+        }
+    }
+
+    fclose(file);
+    return true;
+}
+
 static void upsert_endpoint_route(
     broker_state_t *state,
     cd_endpoint_id_t endpoint,
@@ -472,12 +615,26 @@ static void route_incoming_message(
     if (message->kind == CD_MESSAGE_EVENT) {
         broker_topic_route_t *topic_route;
 
-        topic_route = find_topic_route(state, message->topic, true);
+        topic_route = find_topic_route(state, message->topic, !state->explicit_topic_routes_only);
         if (topic_route == NULL) {
             state->metrics.dropped += 1u;
             return;
         }
-        target_mask = topic_route->recipient_mask;
+        if (topic_route->has_configured_endpoints) {
+            for (i = 0; i < topic_route->configured_endpoint_count; ++i) {
+                size_t endpoint_client_index;
+
+                if (lookup_endpoint_route(
+                        state,
+                        topic_route->configured_endpoints[i],
+                        &endpoint_client_index
+                    )) {
+                    target_mask |= (1ull << endpoint_client_index);
+                }
+            }
+        } else {
+            target_mask = topic_route->recipient_mask;
+        }
     } else if (message->kind == CD_MESSAGE_COMMAND ||
                message->kind == CD_MESSAGE_REQUEST ||
                message->kind == CD_MESSAGE_REPLY) {
@@ -585,7 +742,8 @@ static void accept_new_clients(broker_state_t *state, int listener_fd)
         state->clients[slot].in_use = true;
         state->clients[slot].transport = transport;
         for (i = 0; i < state->topic_route_capacity; ++i) {
-            if (state->topic_routes[i].in_use) {
+            if (state->topic_routes[i].in_use &&
+                !state->topic_routes[i].has_configured_endpoints) {
                 state->topic_routes[i].recipient_mask |= (1ull << slot);
             }
         }
@@ -700,6 +858,17 @@ int main(int argc, char **argv)
         free(state.clients);
         cd_context_shutdown(state.context);
         return 1;
+    }
+
+    if (config.routes_file != NULL) {
+        state.explicit_topic_routes_only = true;
+        if (!load_routes_file(&state, config.routes_file)) {
+            free(state.endpoint_routes);
+            free(state.topic_routes);
+            free(state.clients);
+            cd_context_shutdown(state.context);
+            return 1;
+        }
     }
 
     listener_fd = create_listener_socket(config.socket_path);

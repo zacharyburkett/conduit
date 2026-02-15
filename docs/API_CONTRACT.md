@@ -75,11 +75,15 @@ This document freezes the initial API behavior and ownership rules for the scaff
 ## Broker MVP Semantics (Phase 5 Start)
 
 - `apps/broker/main.c` provides a Unix-socket broker process.
-- Event routing uses topic-keyed route entries with fanout to connected peers.
+- Event routing uses topic route entries:
+  - default mode: fanout to connected peers
+  - `--routes-file` mode: route by explicit `topic -> endpoint...` entries
 - Command/request/reply routing uses endpoint-to-client route entries learned
   from source endpoints on incoming messages.
 - Broker metrics currently expose published/delivered/dropped/timeouts and
   transport error counts.
+- Route file line format is:
+  - `topic <topic_id> <endpoint_id> [endpoint_id...]`
 
 ## Phase Boundaries
 
