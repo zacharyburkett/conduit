@@ -72,6 +72,20 @@ topic 0x00020001 20 21
 Test coverage includes broker reconnect and broker restart recovery scenarios.
 Broker integration tests also validate broker final metrics output counters.
 
+## Load Generator (Phase 6 Start)
+
+Run a synthetic load pass against a running broker:
+
+```sh
+./build/conduit_loadgen --socket /tmp/conduit-broker.sock --events 5000 --requests 1000
+```
+
+Optional flags:
+- `--payload-size <bytes>`
+- `--request-timeout-ns <n>`
+- `--max-duration-ms <n>`
+- `--connect-attempts <n>`
+
 ## Transport Layer (Phase 4 Start)
 
 - Generic transport contract: `include/conduit/transport.h`

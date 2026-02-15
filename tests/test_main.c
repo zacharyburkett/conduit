@@ -15,6 +15,10 @@
 #define CONDUIT_BROKER_BIN "conduit_broker"
 #endif
 
+#ifndef CONDUIT_LOADGEN_BIN
+#define CONDUIT_LOADGEN_BIN "conduit_loadgen"
+#endif
+
 #define ASSERT_TRUE(condition)                                                      \
     do {                                                                            \
         if (!(condition)) {                                                         \
@@ -268,6 +272,66 @@ static pid_t spawn_broker_process(
     }
 
     return broker_pid;
+}
+
+static pid_t spawn_loadgen_process(
+    const char *socket_path,
+    const char *events,
+    const char *requests,
+    const char *payload_size,
+    const char *max_duration_ms,
+    const char *request_timeout_ns,
+    const char *log_path
+)
+{
+    pid_t loadgen_pid;
+
+    if (socket_path == NULL || events == NULL || requests == NULL ||
+        payload_size == NULL || max_duration_ms == NULL ||
+        request_timeout_ns == NULL) {
+        return -1;
+    }
+
+    loadgen_pid = fork();
+    if (loadgen_pid < 0) {
+        return -1;
+    }
+    if (loadgen_pid == 0) {
+        if (log_path != NULL && log_path[0] != '\0') {
+            int log_fd;
+
+            log_fd = open(log_path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+            if (log_fd < 0) {
+                _exit(126);
+            }
+            if (dup2(log_fd, STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0) {
+                close(log_fd);
+                _exit(126);
+            }
+            close(log_fd);
+        }
+
+        execl(
+            CONDUIT_LOADGEN_BIN,
+            CONDUIT_LOADGEN_BIN,
+            "--socket",
+            socket_path,
+            "--events",
+            events,
+            "--requests",
+            requests,
+            "--payload-size",
+            payload_size,
+            "--max-duration-ms",
+            max_duration_ms,
+            "--request-timeout-ns",
+            request_timeout_ns,
+            (char *)NULL
+        );
+        _exit(127);
+    }
+
+    return loadgen_pid;
 }
 
 static int stop_broker_process(pid_t broker_pid, int *out_wait_status)
@@ -2793,6 +2857,83 @@ static int test_broker_restart_with_client_reconnect(void)
     return 0;
 }
 
+static int test_loadgen_soak_against_broker(void)
+{
+    pid_t broker_pid;
+    pid_t loadgen_pid;
+    int broker_status;
+    int loadgen_status;
+    char socket_path[104];
+    char broker_log_path[128];
+    char loadgen_log_path[128];
+    broker_metrics_snapshot_t broker_metrics;
+
+    broker_pid = -1;
+    loadgen_pid = -1;
+    broker_status = 0;
+    loadgen_status = 0;
+
+    if (!unix_path_socket_bind_supported()) {
+        return 0;
+    }
+
+    snprintf(
+        socket_path,
+        sizeof(socket_path),
+        "/tmp/conduit-loadgen-soak-%ld-%u.sock",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    snprintf(
+        broker_log_path,
+        sizeof(broker_log_path),
+        "/tmp/conduit-loadgen-broker-%ld-%u.log",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    snprintf(
+        loadgen_log_path,
+        sizeof(loadgen_log_path),
+        "/tmp/conduit-loadgen-client-%ld-%u.log",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+
+    unlink(socket_path);
+    unlink(broker_log_path);
+    unlink(loadgen_log_path);
+
+    broker_pid = spawn_broker_process(socket_path, NULL, "20000", "0", broker_log_path);
+    ASSERT_TRUE(broker_pid > 0);
+
+    loadgen_pid = spawn_loadgen_process(
+        socket_path,
+        "3000",
+        "600",
+        "64",
+        "15000",
+        "2000000000",
+        loadgen_log_path
+    );
+    ASSERT_TRUE(loadgen_pid > 0);
+    ASSERT_TRUE(waitpid(loadgen_pid, &loadgen_status, 0) == loadgen_pid);
+    ASSERT_TRUE(WIFEXITED(loadgen_status));
+    ASSERT_TRUE(WEXITSTATUS(loadgen_status) == 0);
+
+    ASSERT_TRUE(stop_broker_process(broker_pid, &broker_status) == 0);
+    ASSERT_TRUE(WIFEXITED(broker_status));
+    ASSERT_TRUE(WEXITSTATUS(broker_status) == 0);
+    ASSERT_TRUE(parse_broker_final_metrics(broker_log_path, &broker_metrics) == 0);
+    ASSERT_TRUE(broker_metrics.published >= 4200u);
+    ASSERT_TRUE(broker_metrics.delivered >= 3600u);
+    ASSERT_TRUE(broker_metrics.timeouts == 0u);
+
+    unlink(socket_path);
+    unlink(broker_log_path);
+    unlink(loadgen_log_path);
+    return 0;
+}
+
 static int test_context_validation_edges(void)
 {
     cd_context_t *context;
@@ -2844,6 +2985,7 @@ int main(void)
     RUN_TEST(test_broker_process_routes_between_clients);
     RUN_TEST(test_broker_reconnect_without_restart);
     RUN_TEST(test_broker_restart_with_client_reconnect);
+    RUN_TEST(test_loadgen_soak_against_broker);
     RUN_TEST(test_ipc_codec_roundtrip);
     RUN_TEST(test_ipc_codec_validation_guards);
     RUN_TEST(test_queue_and_argument_edges);

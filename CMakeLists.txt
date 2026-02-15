@@ -57,11 +57,15 @@ if(CONDUIT_BUILD_SAMPLES)
     target_link_libraries(conduit_embedded_sample PRIVATE conduit)
     add_executable(conduit_broker apps/broker/main.c)
     target_link_libraries(conduit_broker PRIVATE conduit)
+    add_executable(conduit_loadgen apps/loadgen/main.c)
+    target_link_libraries(conduit_loadgen PRIVATE conduit)
 
     if(CONDUIT_BUILD_TESTS)
         target_compile_definitions(
             conduit_tests
-            PRIVATE CONDUIT_BROKER_BIN=\"$<TARGET_FILE:conduit_broker>\"
+            PRIVATE
+                CONDUIT_BROKER_BIN=\"$<TARGET_FILE:conduit_broker>\"
+                CONDUIT_LOADGEN_BIN=\"$<TARGET_FILE:conduit_loadgen>\"
         )
         add_test(NAME conduit_embedded_sample_smoke COMMAND conduit_embedded_sample)
     endif()

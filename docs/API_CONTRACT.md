@@ -88,6 +88,14 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - Integration tests also parse broker final metrics output and validate minimum
   expected counters.
 
+## Load/Soak Harness Semantics (Phase 6 Start)
+
+- `apps/loadgen/main.c` drives high-volume event and request/reply traffic
+  through the broker.
+- Loadgen validates message counts and reply correlation under bounded runtime.
+- Integration test `test_loadgen_soak_against_broker` validates broker behavior
+  under synthetic load.
+
 ## Phase Boundaries
 
 - Socket transport framing is available; broker/process supervision is still a

@@ -136,6 +136,12 @@ Acceptance criteria:
 - Throughput and latency targets met (define per hardware baseline).
 - No crash/leak regressions in stress suite.
 
+Status:
+- Started with synthetic load harness:
+  - `apps/loadgen/main.c`
+- Soak integration test added:
+  - `tests/test_main.c` (`test_loadgen_soak_against_broker`)
+
 ## Test Matrix
 
 - Unit:
