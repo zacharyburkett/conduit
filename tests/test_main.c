@@ -3588,6 +3588,159 @@ static int test_broker_diagnostics_request_endpoint(void)
     return 0;
 }
 
+static int test_broker_concurrent_request_reply_ownership(void)
+{
+    enum {
+        REQUEST_THREAD_COUNT = 4,
+        REQUESTS_PER_THREAD = 200
+    };
+
+    cd_context_t *context;
+    cd_bus_t *bus_a;
+    cd_bus_t *bus_b;
+    cd_bus_config_t bus_config;
+    cd_transport_t transport_a;
+    cd_transport_t transport_b;
+    cd_subscription_desc_t request_sub;
+    cd_publish_params_t registration_publish;
+    request_echo_replier_state_t replier_state;
+    pump_thread_args_t pump_args;
+    pthread_t pump_thread;
+    request_thread_args_t request_args[REQUEST_THREAD_COUNT];
+    pthread_t request_threads[REQUEST_THREAD_COUNT];
+    size_t processed;
+    int fd_a;
+    int fd_b;
+    pid_t broker_pid;
+    int broker_status;
+    int i;
+    char socket_path[104];
+    char broker_log_path[128];
+
+    context = NULL;
+    bus_a = NULL;
+    bus_b = NULL;
+    memset(&transport_a, 0, sizeof(transport_a));
+    memset(&transport_b, 0, sizeof(transport_b));
+    memset(&request_sub, 0, sizeof(request_sub));
+    memset(&registration_publish, 0, sizeof(registration_publish));
+    memset(&replier_state, 0, sizeof(replier_state));
+    memset(&pump_args, 0, sizeof(pump_args));
+    memset(request_args, 0, sizeof(request_args));
+    memset(request_threads, 0, sizeof(request_threads));
+    processed = 0u;
+    fd_a = -1;
+    fd_b = -1;
+    broker_pid = -1;
+    broker_status = 0;
+
+    if (!unix_path_socket_bind_supported()) {
+        return 0;
+    }
+
+    snprintf(
+        socket_path,
+        sizeof(socket_path),
+        "/tmp/conduit-broker-threaded-rr-%ld-%u.sock",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    snprintf(
+        broker_log_path,
+        sizeof(broker_log_path),
+        "/tmp/conduit-broker-threaded-rr-log-%ld-%u.txt",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    unlink(socket_path);
+    unlink(broker_log_path);
+
+    broker_pid = spawn_broker_process(socket_path, NULL, "60000", "0", broker_log_path);
+    ASSERT_TRUE(broker_pid > 0);
+    ASSERT_TRUE(wait_for_broker_ready(socket_path, 5000, 1000u) == 0);
+
+    fd_a = connect_unix_socket_retry(socket_path, 1200, 1000u);
+    ASSERT_TRUE(fd_a >= 0);
+    fd_b = connect_unix_socket_retry(socket_path, 1200, 1000u);
+    ASSERT_TRUE(fd_b >= 0);
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 8192u;
+    bus_config.max_subscriptions = 16u;
+    bus_config.max_inflight_requests = 4096u;
+    bus_config.max_transports = 1u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_b), CD_STATUS_OK);
+
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, fd_a, NULL, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, fd_b, NULL, &transport_b), CD_STATUS_OK);
+    fd_a = -1;
+    fd_b = -1;
+    ASSERT_STATUS(cd_bus_attach_transport(bus_a, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_attach_transport(bus_b, &transport_b), CD_STATUS_OK);
+
+    replier_state.bus = bus_b;
+    request_sub.endpoint = 901u;
+    request_sub.topic = 0x00C10001u;
+    request_sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_REQUEST);
+    request_sub.handler = request_echo_replier_handler;
+    request_sub.user_data = &replier_state;
+    ASSERT_STATUS(cd_subscribe(bus_b, &request_sub, NULL), CD_STATUS_OK);
+
+    registration_publish.source_endpoint = 901u;
+    registration_publish.topic = 0x00C1FF01u;
+    registration_publish.flags = 0u;
+    registration_publish.payload = "register-threaded";
+    registration_publish.payload_size = strlen("register-threaded");
+    ASSERT_STATUS(cd_publish(bus_b, &registration_publish, NULL), CD_STATUS_OK);
+
+    for (i = 0; i < 250; ++i) {
+        processed = 0u;
+        ASSERT_STATUS(cd_bus_pump(bus_b, 0u, &processed), CD_STATUS_OK);
+        ASSERT_STATUS(cd_bus_pump(bus_a, 0u, &processed), CD_STATUS_OK);
+        usleep(1000u);
+    }
+
+    pump_args.bus_a = bus_a;
+    pump_args.bus_b = bus_b;
+    atomic_init(&pump_args.stop, 0);
+    pump_args.failures = 0;
+    ASSERT_TRUE(pthread_create(&pump_thread, NULL, pump_pair_thread_main, &pump_args) == 0);
+
+    for (i = 0; i < REQUEST_THREAD_COUNT; ++i) {
+        request_args[i].request_bus = bus_a;
+        request_args[i].thread_index = i;
+        request_args[i].request_count = REQUESTS_PER_THREAD;
+        request_args[i].failures = 0;
+        ASSERT_TRUE(pthread_create(&request_threads[i], NULL, request_thread_main, &request_args[i]) == 0);
+    }
+
+    for (i = 0; i < REQUEST_THREAD_COUNT; ++i) {
+        ASSERT_TRUE(pthread_join(request_threads[i], NULL) == 0);
+        ASSERT_TRUE(request_args[i].failures == 0);
+    }
+
+    atomic_store_explicit(&pump_args.stop, 1, memory_order_release);
+    ASSERT_TRUE(pthread_join(pump_thread, NULL) == 0);
+    ASSERT_TRUE(pump_args.failures == 0);
+
+    ASSERT_TRUE(replier_state.request_hits == (REQUEST_THREAD_COUNT * REQUESTS_PER_THREAD));
+
+    cd_ipc_socket_transport_close(&transport_a);
+    cd_ipc_socket_transport_close(&transport_b);
+    cd_bus_destroy(bus_a);
+    cd_bus_destroy(bus_b);
+    cd_context_shutdown(context);
+
+    ASSERT_TRUE(stop_broker_process(broker_pid, &broker_status) == 0);
+    ASSERT_TRUE(WIFEXITED(broker_status));
+    ASSERT_TRUE(WEXITSTATUS(broker_status) == 0);
+    unlink(socket_path);
+    unlink(broker_log_path);
+    return 0;
+}
+
 static int test_broker_restart_with_client_reconnect(void)
 {
     cd_context_t *context;
@@ -4278,6 +4431,7 @@ int main(void)
     RUN_TEST(test_broker_process_routes_between_clients);
     RUN_TEST(test_broker_reconnect_without_restart);
     RUN_TEST(test_broker_diagnostics_request_endpoint);
+    RUN_TEST(test_broker_concurrent_request_reply_ownership);
     RUN_TEST(test_broker_restart_with_client_reconnect);
     RUN_TEST(test_loadgen_soak_against_broker);
     RUN_TEST(test_loadgen_profile_baseline_against_broker);

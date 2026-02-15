@@ -185,6 +185,7 @@ Status:
   - concurrent request/reply ownership stress tests added:
     - `tests/test_main.c` (`test_threadsafe_concurrent_request_reply_ownership`)
     - `tests/test_main.c` (`test_ipc_socket_transport_concurrent_request_reply_ownership`)
+    - `tests/test_main.c` (`test_broker_concurrent_request_reply_ownership`)
   - IPC socket transport RX/TX critical sections now mutex-protected:
     - `src/transport_ipc_socket.c`
 
