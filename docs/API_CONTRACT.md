@@ -85,6 +85,8 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - Route file line format is:
   - `topic <topic_id> <endpoint_id> [endpoint_id...]`
 - Integration coverage includes reconnect and broker restart recovery paths.
+- Integration tests also parse broker final metrics output and validate minimum
+  expected counters.
 
 ## Phase Boundaries
 

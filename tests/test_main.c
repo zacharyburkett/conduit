@@ -1,6 +1,7 @@
 #include "conduit/conduit.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,6 +81,14 @@ typedef struct request_replier_state {
     size_t reply_payload_size;
     uint16_t reply_flags;
 } request_replier_state_t;
+
+typedef struct broker_metrics_snapshot {
+    uint64_t published;
+    uint64_t delivered;
+    uint64_t dropped;
+    uint64_t timeouts;
+    uint64_t transport_errors;
+} broker_metrics_snapshot_t;
 
 static void close_fd_if_open(int *fd)
 {
@@ -199,7 +208,8 @@ static pid_t spawn_broker_process(
     const char *socket_path,
     const char *routes_path,
     const char *run_ms,
-    const char *metrics_interval_ms
+    const char *metrics_interval_ms,
+    const char *log_path
 )
 {
     pid_t broker_pid;
@@ -213,6 +223,20 @@ static pid_t spawn_broker_process(
         return -1;
     }
     if (broker_pid == 0) {
+        if (log_path != NULL && log_path[0] != '\0') {
+            int log_fd;
+
+            log_fd = open(log_path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+            if (log_fd < 0) {
+                _exit(126);
+            }
+            if (dup2(log_fd, STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0) {
+                close(log_fd);
+                _exit(126);
+            }
+            close(log_fd);
+        }
+
         if (routes_path != NULL && routes_path[0] != '\0') {
             execl(
                 CONDUIT_BROKER_BIN,
@@ -265,6 +289,63 @@ static int stop_broker_process(pid_t broker_pid, int *out_wait_status)
         *out_wait_status = status;
     }
     return 0;
+}
+
+static int parse_broker_final_metrics(
+    const char *log_path,
+    broker_metrics_snapshot_t *out_metrics
+)
+{
+    FILE *file;
+    char line[512];
+    int found;
+
+    if (log_path == NULL || out_metrics == NULL) {
+        return 1;
+    }
+
+    memset(out_metrics, 0, sizeof(*out_metrics));
+    file = fopen(log_path, "r");
+    if (file == NULL) {
+        return 1;
+    }
+
+    found = 0;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        unsigned long long published;
+        unsigned long long delivered;
+        unsigned long long dropped;
+        unsigned long long timeouts;
+        unsigned long long transport_errors;
+        size_t clients;
+
+        if (strncmp(line, "[broker] final ", strlen("[broker] final ")) != 0) {
+            continue;
+        }
+
+        if (sscanf(
+                line,
+                "[broker] final clients=%zu published=%llu delivered=%llu dropped=%llu "
+                "timeouts=%llu transport_errors=%llu",
+                &clients,
+                &published,
+                &delivered,
+                &dropped,
+                &timeouts,
+                &transport_errors
+            ) == 6) {
+            (void)clients;
+            out_metrics->published = (uint64_t)published;
+            out_metrics->delivered = (uint64_t)delivered;
+            out_metrics->dropped = (uint64_t)dropped;
+            out_metrics->timeouts = (uint64_t)timeouts;
+            out_metrics->transport_errors = (uint64_t)transport_errors;
+            found = 1;
+        }
+    }
+
+    fclose(file);
+    return found ? 0 : 1;
 }
 
 static void test_free_adapter(void *user_data, void *ptr)
@@ -2038,6 +2119,8 @@ static int test_broker_process_routes_between_clients(void)
     int i;
     char socket_path[104];
     char routes_path[128];
+    char broker_log_path[128];
+    broker_metrics_snapshot_t broker_metrics;
 
     context = NULL;
     bus_a = NULL;
@@ -2074,11 +2157,19 @@ static int test_broker_process_routes_between_clients(void)
         (long)getpid(),
         (unsigned)rand()
     );
+    snprintf(
+        broker_log_path,
+        sizeof(broker_log_path),
+        "/tmp/conduit-broker-log-%ld-%u.txt",
+        (long)getpid(),
+        (unsigned)rand()
+    );
     unlink(socket_path);
     unlink(routes_path);
+    unlink(broker_log_path);
     ASSERT_TRUE(write_text_file(routes_path, "topic 3501 901\n") == 0);
 
-    broker_pid = spawn_broker_process(socket_path, routes_path, "8000", "0");
+    broker_pid = spawn_broker_process(socket_path, routes_path, "8000", "0", broker_log_path);
     ASSERT_TRUE(broker_pid > 0);
 
     fd_a = connect_unix_socket_retry(socket_path, 1200, 1000u);
@@ -2204,8 +2295,13 @@ static int test_broker_process_routes_between_clients(void)
     ASSERT_TRUE(stop_broker_process(broker_pid, &broker_status) == 0);
     ASSERT_TRUE(WIFEXITED(broker_status));
     ASSERT_TRUE(WEXITSTATUS(broker_status) == 0);
+    ASSERT_TRUE(parse_broker_final_metrics(broker_log_path, &broker_metrics) == 0);
+    ASSERT_TRUE(broker_metrics.published >= 5u);
+    ASSERT_TRUE(broker_metrics.delivered >= 3u);
+    ASSERT_TRUE(broker_metrics.dropped >= 1u);
     unlink(socket_path);
     unlink(routes_path);
+    unlink(broker_log_path);
     return 0;
 }
 
@@ -2232,6 +2328,8 @@ static int test_broker_reconnect_without_restart(void)
     int broker_status;
     int i;
     char socket_path[104];
+    char broker_log_path[128];
+    broker_metrics_snapshot_t broker_metrics;
 
     context = NULL;
     bus_a = NULL;
@@ -2259,9 +2357,17 @@ static int test_broker_reconnect_without_restart(void)
         (long)getpid(),
         (unsigned)rand()
     );
+    snprintf(
+        broker_log_path,
+        sizeof(broker_log_path),
+        "/tmp/conduit-broker-reconnect-log-%ld-%u.txt",
+        (long)getpid(),
+        (unsigned)rand()
+    );
     unlink(socket_path);
+    unlink(broker_log_path);
 
-    broker_pid = spawn_broker_process(socket_path, NULL, "15000", "0");
+    broker_pid = spawn_broker_process(socket_path, NULL, "15000", "0", broker_log_path);
     ASSERT_TRUE(broker_pid > 0);
 
     fd_a = connect_unix_socket_retry(socket_path, 1200, 1000u);
@@ -2427,7 +2533,11 @@ static int test_broker_reconnect_without_restart(void)
     ASSERT_TRUE(stop_broker_process(broker_pid, &broker_status) == 0);
     ASSERT_TRUE(WIFEXITED(broker_status));
     ASSERT_TRUE(WEXITSTATUS(broker_status) == 0);
+    ASSERT_TRUE(parse_broker_final_metrics(broker_log_path, &broker_metrics) == 0);
+    ASSERT_TRUE(broker_metrics.published >= 6u);
+    ASSERT_TRUE(broker_metrics.delivered >= 4u);
     unlink(socket_path);
+    unlink(broker_log_path);
     return 0;
 }
 
@@ -2454,6 +2564,10 @@ static int test_broker_restart_with_client_reconnect(void)
     int broker_status;
     int i;
     char socket_path[104];
+    char broker_log_path_a[128];
+    char broker_log_path_b[128];
+    broker_metrics_snapshot_t broker_metrics_a;
+    broker_metrics_snapshot_t broker_metrics_b;
 
     context = NULL;
     bus_a = NULL;
@@ -2481,9 +2595,25 @@ static int test_broker_restart_with_client_reconnect(void)
         (long)getpid(),
         (unsigned)rand()
     );
+    snprintf(
+        broker_log_path_a,
+        sizeof(broker_log_path_a),
+        "/tmp/conduit-broker-restart-log-a-%ld-%u.txt",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    snprintf(
+        broker_log_path_b,
+        sizeof(broker_log_path_b),
+        "/tmp/conduit-broker-restart-log-b-%ld-%u.txt",
+        (long)getpid(),
+        (unsigned)rand()
+    );
     unlink(socket_path);
+    unlink(broker_log_path_a);
+    unlink(broker_log_path_b);
 
-    broker_pid = spawn_broker_process(socket_path, NULL, "20000", "0");
+    broker_pid = spawn_broker_process(socket_path, NULL, "20000", "0", broker_log_path_a);
     ASSERT_TRUE(broker_pid > 0);
 
     fd_a = connect_unix_socket_retry(socket_path, 1200, 1000u);
@@ -2568,6 +2698,9 @@ static int test_broker_restart_with_client_reconnect(void)
     ASSERT_TRUE(stop_broker_process(broker_pid, &broker_status) == 0);
     ASSERT_TRUE(WIFEXITED(broker_status));
     ASSERT_TRUE(WEXITSTATUS(broker_status) == 0);
+    ASSERT_TRUE(parse_broker_final_metrics(broker_log_path_a, &broker_metrics_a) == 0);
+    ASSERT_TRUE(broker_metrics_a.published >= 3u);
+    ASSERT_TRUE(broker_metrics_a.delivered >= 2u);
 
     ASSERT_STATUS(cd_bus_detach_transport(bus_a, &transport_a), CD_STATUS_OK);
     ASSERT_STATUS(cd_bus_detach_transport(bus_b, &transport_b), CD_STATUS_OK);
@@ -2576,7 +2709,7 @@ static int test_broker_restart_with_client_reconnect(void)
     memset(&transport_a, 0, sizeof(transport_a));
     memset(&transport_b, 0, sizeof(transport_b));
 
-    broker_pid = spawn_broker_process(socket_path, NULL, "20000", "0");
+    broker_pid = spawn_broker_process(socket_path, NULL, "20000", "0", broker_log_path_b);
     ASSERT_TRUE(broker_pid > 0);
 
     fd_a = connect_unix_socket_retry(socket_path, 1200, 1000u);
@@ -2651,7 +2784,12 @@ static int test_broker_restart_with_client_reconnect(void)
     ASSERT_TRUE(stop_broker_process(broker_pid, &broker_status) == 0);
     ASSERT_TRUE(WIFEXITED(broker_status));
     ASSERT_TRUE(WEXITSTATUS(broker_status) == 0);
+    ASSERT_TRUE(parse_broker_final_metrics(broker_log_path_b, &broker_metrics_b) == 0);
+    ASSERT_TRUE(broker_metrics_b.published >= 3u);
+    ASSERT_TRUE(broker_metrics_b.delivered >= 2u);
     unlink(socket_path);
+    unlink(broker_log_path_a);
+    unlink(broker_log_path_b);
     return 0;
 }
 

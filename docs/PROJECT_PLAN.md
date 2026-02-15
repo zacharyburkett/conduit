@@ -122,6 +122,7 @@ Status:
   - `tests/test_main.c` (`test_broker_reconnect_without_restart`)
 - Broker restart + client reconnect integration test added:
   - `tests/test_main.c` (`test_broker_restart_with_client_reconnect`)
+- Broker integration tests now assert broker final metrics output snapshots.
 
 ## Phase 6: Hardening and Tooling
 

@@ -70,6 +70,7 @@ topic 0x00020001 20 21
 ```
 
 Test coverage includes broker reconnect and broker restart recovery scenarios.
+Broker integration tests also validate broker final metrics output counters.
 
 ## Transport Layer (Phase 4 Start)
 
