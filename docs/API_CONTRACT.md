@@ -72,6 +72,15 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - Payloads above configured codec limits return `CD_STATUS_CAPACITY_REACHED`.
 - Decoded payload pointers reference the input frame memory.
 
+## Broker MVP Semantics (Phase 5 Start)
+
+- `apps/broker/main.c` provides a Unix-socket broker process.
+- Event routing uses topic-keyed route entries with fanout to connected peers.
+- Command/request/reply routing uses endpoint-to-client route entries learned
+  from source endpoints on incoming messages.
+- Broker metrics currently expose published/delivered/dropped/timeouts and
+  transport error counts.
+
 ## Phase Boundaries
 
 - Socket transport framing is available; broker/process supervision is still a

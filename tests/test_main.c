@@ -1,11 +1,18 @@
 #include "conduit/conduit.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef CONDUIT_BROKER_BIN
+#define CONDUIT_BROKER_BIN "conduit_broker"
+#endif
 
 #define ASSERT_TRUE(condition)                                                      \
     do {                                                                            \
@@ -80,6 +87,84 @@ static void close_fd_if_open(int *fd)
         close(*fd);
         *fd = -1;
     }
+}
+
+static int connect_unix_socket_retry(
+    const char *socket_path,
+    int max_attempts,
+    useconds_t sleep_us
+)
+{
+    int attempt;
+    struct sockaddr_un address;
+
+    if (socket_path == NULL || max_attempts <= 0 || strlen(socket_path) >= sizeof(address.sun_path)) {
+        return -1;
+    }
+
+    memset(&address, 0, sizeof(address));
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+    address.sun_len = (uint8_t)sizeof(address);
+#endif
+    address.sun_family = AF_UNIX;
+    (void)strncpy(address.sun_path, socket_path, sizeof(address.sun_path) - 1u);
+
+    for (attempt = 0; attempt < max_attempts; ++attempt) {
+        int fd;
+
+        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+
+        if (connect(fd, (const struct sockaddr *)&address, sizeof(address)) == 0) {
+            return fd;
+        }
+
+        close(fd);
+        if (errno != ENOENT && errno != ECONNREFUSED && errno != EINTR) {
+            return -1;
+        }
+        usleep(sleep_us);
+    }
+
+    return -1;
+}
+
+static int unix_path_socket_bind_supported(void)
+{
+    int fd;
+    int bind_result;
+    struct sockaddr_un address;
+    char socket_path[104];
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return 0;
+    }
+
+    memset(&address, 0, sizeof(address));
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+    address.sun_len = (uint8_t)sizeof(address);
+#endif
+    address.sun_family = AF_UNIX;
+    snprintf(
+        socket_path,
+        sizeof(socket_path),
+        "/tmp/conduit-bind-check-%ld.sock",
+        (long)getpid()
+    );
+    (void)strncpy(address.sun_path, socket_path, sizeof(address.sun_path) - 1u);
+    unlink(socket_path);
+
+    bind_result = bind(fd, (const struct sockaddr *)&address, sizeof(address));
+    close(fd);
+    unlink(socket_path);
+
+    return bind_result == 0 ? 1 : 0;
 }
 
 static void test_free_adapter(void *user_data, void *ptr)
@@ -1825,6 +1910,201 @@ static int test_ipc_socket_transport_forked_two_process_roundtrip(void)
     return 0;
 }
 
+static int test_broker_process_routes_between_clients(void)
+{
+    cd_context_t *context;
+    cd_bus_t *bus_a;
+    cd_bus_t *bus_b;
+    cd_bus_config_t bus_config;
+    cd_transport_t transport_a;
+    cd_transport_t transport_b;
+    cd_subscription_desc_t event_sub;
+    cd_subscription_desc_t request_sub;
+    request_replier_state_t replier_state;
+    capture_state_t capture;
+    handler_state_t event_handler;
+    cd_publish_params_t registration_publish;
+    cd_publish_params_t event_publish;
+    cd_request_params_t request;
+    cd_request_token_t token;
+    cd_reply_t reply;
+    int ready;
+    size_t processed;
+    cd_status_t poll_status;
+    int fd_a;
+    int fd_b;
+    pid_t broker_pid;
+    int broker_status;
+    int i;
+    char socket_path[104];
+
+    context = NULL;
+    bus_a = NULL;
+    bus_b = NULL;
+    memset(&transport_a, 0, sizeof(transport_a));
+    memset(&transport_b, 0, sizeof(transport_b));
+    memset(&capture, 0, sizeof(capture));
+    memset(&event_handler, 0, sizeof(event_handler));
+    memset(&replier_state, 0, sizeof(replier_state));
+    memset(&reply, 0, sizeof(reply));
+    fd_a = -1;
+    fd_b = -1;
+    broker_pid = -1;
+    broker_status = 0;
+    token = 0u;
+    ready = 0;
+    poll_status = CD_STATUS_OK;
+
+    if (!unix_path_socket_bind_supported()) {
+        return 0;
+    }
+
+    snprintf(
+        socket_path,
+        sizeof(socket_path),
+        "/tmp/conduit-broker-test-%ld-%u.sock",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    unlink(socket_path);
+
+    broker_pid = fork();
+    ASSERT_TRUE(broker_pid >= 0);
+    if (broker_pid == 0) {
+        execl(
+            CONDUIT_BROKER_BIN,
+            CONDUIT_BROKER_BIN,
+            "--socket",
+            socket_path,
+            "--run-ms",
+            "8000",
+            "--metrics-interval-ms",
+            "0",
+            (char *)NULL
+        );
+        _exit(127);
+    }
+
+    fd_a = connect_unix_socket_retry(socket_path, 1200, 1000u);
+    ASSERT_TRUE(fd_a >= 0);
+    fd_b = connect_unix_socket_retry(socket_path, 1200, 1000u);
+    ASSERT_TRUE(fd_b >= 0);
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 64u;
+    bus_config.max_subscriptions = 16u;
+    bus_config.max_inflight_requests = 16u;
+    bus_config.max_transports = 1u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_b), CD_STATUS_OK);
+
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, fd_a, NULL, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, fd_b, NULL, &transport_b), CD_STATUS_OK);
+    fd_a = -1;
+    fd_b = -1;
+    ASSERT_STATUS(cd_bus_attach_transport(bus_a, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_attach_transport(bus_b, &transport_b), CD_STATUS_OK);
+
+    event_handler.capture = &capture;
+    event_handler.marker = 901;
+    event_handler.return_status = CD_STATUS_OK;
+
+    memset(&event_sub, 0, sizeof(event_sub));
+    event_sub.endpoint = 901u;
+    event_sub.topic = 3501u;
+    event_sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_EVENT);
+    event_sub.handler = generic_handler;
+    event_sub.user_data = &event_handler;
+    ASSERT_STATUS(cd_subscribe(bus_b, &event_sub, NULL), CD_STATUS_OK);
+
+    replier_state.bus = bus_b;
+    replier_state.reply_payload = "broker-ok";
+    replier_state.reply_payload_size = strlen("broker-ok");
+    replier_state.reply_flags = 0u;
+
+    memset(&request_sub, 0, sizeof(request_sub));
+    request_sub.endpoint = 955u;
+    request_sub.topic = 3502u;
+    request_sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_REQUEST);
+    request_sub.handler = request_replier_handler;
+    request_sub.user_data = &replier_state;
+    ASSERT_STATUS(cd_subscribe(bus_b, &request_sub, NULL), CD_STATUS_OK);
+
+    memset(&registration_publish, 0, sizeof(registration_publish));
+    registration_publish.source_endpoint = 955u;
+    registration_publish.topic = 3599u;
+    registration_publish.flags = 0u;
+    registration_publish.payload = "register";
+    registration_publish.payload_size = strlen("register");
+    ASSERT_STATUS(cd_publish(bus_b, &registration_publish, NULL), CD_STATUS_OK);
+
+    for (i = 0; i < 200; ++i) {
+        processed = 0u;
+        ASSERT_STATUS(cd_bus_pump(bus_b, 0u, &processed), CD_STATUS_OK);
+        ASSERT_STATUS(cd_bus_pump(bus_a, 0u, &processed), CD_STATUS_OK);
+        usleep(1000u);
+    }
+
+    memset(&event_publish, 0, sizeof(event_publish));
+    event_publish.source_endpoint = 10u;
+    event_publish.topic = 3501u;
+    event_publish.schema_id = 1u;
+    event_publish.schema_version = 1u;
+    event_publish.flags = 0u;
+    event_publish.payload = "broker-ev";
+    event_publish.payload_size = strlen("broker-ev");
+    ASSERT_STATUS(cd_publish(bus_a, &event_publish, NULL), CD_STATUS_OK);
+
+    memset(&request, 0, sizeof(request));
+    request.source_endpoint = 10u;
+    request.target_endpoint = 955u;
+    request.topic = 3502u;
+    request.schema_id = 2u;
+    request.schema_version = 1u;
+    request.flags = 0u;
+    request.timeout_ns = 2000000000ull;
+    request.payload = "broker-ask";
+    request.payload_size = strlen("broker-ask");
+    ASSERT_STATUS(cd_request_async(bus_a, &request, &token), CD_STATUS_OK);
+
+    for (i = 0; i < 3000; ++i) {
+        processed = 0u;
+        ASSERT_STATUS(cd_bus_pump(bus_b, 0u, &processed), CD_STATUS_OK);
+        ASSERT_STATUS(cd_bus_pump(bus_a, 0u, &processed), CD_STATUS_OK);
+        poll_status = cd_poll_reply(bus_a, token, &reply, &ready);
+        if (poll_status == CD_STATUS_OK && ready == 1) {
+            break;
+        }
+        ASSERT_TRUE(poll_status == CD_STATUS_OK);
+        ASSERT_TRUE(ready == 0);
+        usleep(1000u);
+    }
+
+    ASSERT_TRUE(capture.count == 1);
+    ASSERT_TRUE(strcmp(capture.payloads[0], "broker-ev") == 0);
+    ASSERT_TRUE(replier_state.request_hits == 1);
+    ASSERT_TRUE(strcmp(replier_state.last_payload, "broker-ask") == 0);
+    ASSERT_TRUE(poll_status == CD_STATUS_OK);
+    ASSERT_TRUE(ready == 1);
+    ASSERT_TRUE(reply.payload_size == strlen("broker-ok"));
+    ASSERT_TRUE(strncmp((const char *)reply.payload, "broker-ok", reply.payload_size) == 0);
+    cd_reply_dispose(bus_a, &reply);
+
+    cd_ipc_socket_transport_close(&transport_a);
+    cd_ipc_socket_transport_close(&transport_b);
+    cd_bus_destroy(bus_a);
+    cd_bus_destroy(bus_b);
+    cd_context_shutdown(context);
+
+    ASSERT_TRUE(kill(broker_pid, SIGTERM) == 0 || errno == ESRCH);
+    ASSERT_TRUE(waitpid(broker_pid, &broker_status, 0) == broker_pid);
+    ASSERT_TRUE(WIFEXITED(broker_status));
+    ASSERT_TRUE(WEXITSTATUS(broker_status) == 0);
+    unlink(socket_path);
+    return 0;
+}
+
 static int test_context_validation_edges(void)
 {
     cd_context_t *context;
@@ -1873,6 +2153,7 @@ int main(void)
     RUN_TEST(test_ipc_socket_transport_protocol_mismatch_path);
     RUN_TEST(test_ipc_socket_transport_disconnect_paths);
     RUN_TEST(test_ipc_socket_transport_forked_two_process_roundtrip);
+    RUN_TEST(test_broker_process_routes_between_clients);
     RUN_TEST(test_ipc_codec_roundtrip);
     RUN_TEST(test_ipc_codec_validation_guards);
     RUN_TEST(test_queue_and_argument_edges);

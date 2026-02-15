@@ -40,6 +40,21 @@ This sample demonstrates deterministic embedded dispatch with the flow:
 - `map.generated`
 - `entity.spawn.request` (request/reply)
 
+## Broker App (Phase 5 Start)
+
+Run the broker over a Unix domain socket:
+
+```sh
+./build/conduit_broker --socket /tmp/conduit-broker.sock
+```
+
+Optional flags:
+- `--max-clients <n>`
+- `--max-topic-routes <n>`
+- `--max-endpoint-routes <n>`
+- `--metrics-interval-ms <n>`
+- `--run-ms <n>`
+
 ## Transport Layer (Phase 4 Start)
 
 - Generic transport contract: `include/conduit/transport.h`

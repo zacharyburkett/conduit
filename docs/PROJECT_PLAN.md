@@ -107,6 +107,18 @@ Acceptance criteria:
 - Multi-process smoke test with broker in middle.
 - Broker restarts handled cleanly by reconnect logic.
 
+Status:
+- Started with broker executable:
+  - `apps/broker/main.c`
+- Broker currently routes:
+  - events by topic route table
+  - command/request/reply by endpoint route table
+- Basic broker metrics are emitted:
+  - published/delivered/dropped/timeouts/transport_errors
+- Integration test added (broker process in the middle):
+  - `tests/test_main.c` (`test_broker_process_routes_between_clients`)
+  - test auto-skips when the runtime disallows Unix socket path bind.
+
 ## Phase 6: Hardening and Tooling
 
 Deliverables:
