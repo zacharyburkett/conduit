@@ -1,0 +1,55 @@
+name: conduit-ci
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "**"
+      - ".github/workflows/conduit-ci.yml"
+  pull_request:
+    paths:
+      - "**"
+      - ".github/workflows/conduit-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: "${{ matrix.os }}"
+    runs-on: "${{ matrix.os }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCONDUIT_BUILD_TESTS=ON
+          -DCONDUIT_BUILD_SAMPLES=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --build-config Release
+
+      - name: Capture Loadgen Profile
+        run: bash scripts/ci/capture_loadgen_profile.sh build "artifacts/${{ matrix.os }}"
+
+      - name: Upload Loadgen Profile Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "conduit-loadgen-profile-${{ matrix.os }}"
+          path: "artifacts/${{ matrix.os }}"
+          if-no-files-found: error

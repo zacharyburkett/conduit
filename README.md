@@ -27,6 +27,20 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+## CI Matrix (Phase 6 Start)
+
+GitHub Actions workflow:
+
+- `.github/workflows/conduit-ci.yml`
+
+Current CI behavior:
+
+- OS matrix: `ubuntu-latest`, `macos-latest`
+- Runs: configure, build, `ctest`
+- Captures loadgen profile artifacts per OS with:
+  - `scripts/ci/capture_loadgen_profile.sh`
+  - `summary.txt`, `loadgen.log`, `broker.log`
+
 ## Embedded Sample
 
 Build includes the sample app by default (`CONDUIT_BUILD_SAMPLES=ON`):

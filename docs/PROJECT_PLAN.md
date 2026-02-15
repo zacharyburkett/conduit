@@ -157,6 +157,14 @@ Status:
     - throughput >= 200 msg/s
     - request avg RTT <= 50 ms
     - request max RTT <= 500 ms
+- CI test matrix start added:
+  - `.github/workflows/conduit-ci.yml`
+  - matrix: `ubuntu-latest` + `macos-latest`
+  - runs configure/build/ctest for conduit
+  - runs `scripts/ci/capture_loadgen_profile.sh` and uploads per-OS artifacts:
+    - `summary.txt`
+    - `loadgen.log`
+    - `broker.log`
 
 ## Test Matrix
 
