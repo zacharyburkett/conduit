@@ -86,6 +86,9 @@ Status:
   - `src/transport_inproc.c`
 - Bus transport integration and cross-bus tests are in place as groundwork for
   IPC framing work.
+- IPC frame codec implemented with version/size guards:
+  - `include/conduit/transport_ipc.h`
+  - `src/transport_ipc.c`
 
 ## Phase 5: Broker/Bridge App
 

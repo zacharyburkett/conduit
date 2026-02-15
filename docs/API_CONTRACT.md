@@ -58,6 +58,15 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - Replies from transport are captured through normal inflight correlation.
 - Timed-out requests are dropped if later encountered in the dispatch queue.
 
+## IPC Frame Codec Semantics
+
+- `cd_ipc_encode_envelope` writes a fixed 64-byte header plus payload bytes.
+- `cd_ipc_decode_envelope` validates protocol magic, version, header size, and
+  frame length against encoded payload size.
+- Protocol/frame mismatches return `CD_STATUS_SCHEMA_MISMATCH`.
+- Payloads above configured codec limits return `CD_STATUS_CAPACITY_REACHED`.
+- Decoded payload pointers reference the input frame memory.
+
 ## Phase Boundaries
 
 - Transport adapters are reserved for later milestones.

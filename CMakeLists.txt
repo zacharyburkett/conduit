@@ -10,6 +10,7 @@ add_library(conduit
     src/core.c
     src/context.c
     src/bus.c
+    src/transport_ipc.c
     src/transport_inproc.c
 )
 add_library(conduit::conduit ALIAS conduit)

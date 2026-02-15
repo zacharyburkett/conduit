@@ -924,6 +924,167 @@ static int test_queue_and_argument_edges(void)
     return 0;
 }
 
+static int test_ipc_codec_roundtrip(void)
+{
+    cd_ipc_codec_config_t codec_config;
+    cd_envelope_t message;
+    cd_envelope_t decoded;
+    uint8_t frame[256];
+    size_t frame_size;
+    size_t expected_size;
+    const char payload[] = "frame-hello";
+
+    memset(&codec_config, 0, sizeof(codec_config));
+    codec_config.max_payload_size = 128u;
+
+    expected_size = 0u;
+    ASSERT_STATUS(
+        cd_ipc_frame_size_for_payload(strlen(payload), &codec_config, &expected_size),
+        CD_STATUS_OK
+    );
+    ASSERT_TRUE(expected_size == CD_IPC_FRAME_HEADER_SIZE + strlen(payload));
+
+    memset(&message, 0, sizeof(message));
+    message.message_id = 88u;
+    message.correlation_id = 77u;
+    message.kind = CD_MESSAGE_REQUEST;
+    message.topic = 301u;
+    message.source_endpoint = 12u;
+    message.target_endpoint = 99u;
+    message.schema_id = 111u;
+    message.schema_version = 2u;
+    message.flags = CD_MESSAGE_FLAG_HIGH_PRIORITY;
+    message.timestamp_ns = 123456u;
+    message.payload = payload;
+    message.payload_size = strlen(payload);
+
+    frame_size = 0u;
+    ASSERT_STATUS(
+        cd_ipc_encode_envelope(&message, &codec_config, frame, sizeof(frame), &frame_size),
+        CD_STATUS_OK
+    );
+    ASSERT_TRUE(frame_size == expected_size);
+
+    memset(&decoded, 0, sizeof(decoded));
+    ASSERT_STATUS(cd_ipc_decode_envelope(frame, frame_size, &codec_config, &decoded), CD_STATUS_OK);
+    ASSERT_TRUE(decoded.message_id == message.message_id);
+    ASSERT_TRUE(decoded.correlation_id == message.correlation_id);
+    ASSERT_TRUE(decoded.kind == message.kind);
+    ASSERT_TRUE(decoded.topic == message.topic);
+    ASSERT_TRUE(decoded.source_endpoint == message.source_endpoint);
+    ASSERT_TRUE(decoded.target_endpoint == message.target_endpoint);
+    ASSERT_TRUE(decoded.schema_id == message.schema_id);
+    ASSERT_TRUE(decoded.schema_version == message.schema_version);
+    ASSERT_TRUE(decoded.flags == message.flags);
+    ASSERT_TRUE(decoded.timestamp_ns == message.timestamp_ns);
+    ASSERT_TRUE(decoded.payload_size == message.payload_size);
+    ASSERT_TRUE(decoded.payload != NULL);
+    ASSERT_TRUE(memcmp(decoded.payload, payload, message.payload_size) == 0);
+
+    return 0;
+}
+
+static int test_ipc_codec_validation_guards(void)
+{
+    cd_ipc_codec_config_t codec_config;
+    cd_ipc_codec_config_t tiny_codec_config;
+    cd_envelope_t message;
+    cd_envelope_t decoded;
+    uint8_t frame[128];
+    size_t frame_size;
+    size_t computed_size;
+    const char payload[] = "abcd";
+
+    enum {
+        FRAME_OFFSET_VERSION = 4u,
+        FRAME_OFFSET_FLAGS = 46u,
+        FRAME_OFFSET_PAYLOAD_SIZE = 56u
+    };
+
+    memset(&codec_config, 0, sizeof(codec_config));
+    codec_config.max_payload_size = 64u;
+
+    computed_size = 5u;
+    ASSERT_STATUS(cd_ipc_frame_size_for_payload(65u, &codec_config, &computed_size), CD_STATUS_CAPACITY_REACHED);
+    ASSERT_TRUE(computed_size == 0u);
+
+    memset(&message, 0, sizeof(message));
+    message.message_id = 1u;
+    message.kind = CD_MESSAGE_EVENT;
+    message.topic = 11u;
+    message.flags = CD_MESSAGE_FLAG_LOCAL_ONLY;
+    message.payload = payload;
+    message.payload_size = strlen(payload);
+
+    frame_size = 9u;
+    ASSERT_STATUS(
+        cd_ipc_encode_envelope(
+            &message,
+            &codec_config,
+            frame,
+            CD_IPC_FRAME_HEADER_SIZE + message.payload_size - 1u,
+            &frame_size
+        ),
+        CD_STATUS_CAPACITY_REACHED
+    );
+    ASSERT_TRUE(frame_size == 0u);
+
+    frame_size = 0u;
+    ASSERT_STATUS(
+        cd_ipc_encode_envelope(&message, &codec_config, frame, sizeof(frame), &frame_size),
+        CD_STATUS_OK
+    );
+
+    frame[FRAME_OFFSET_VERSION] ^= 0x01u;
+    ASSERT_STATUS(
+        cd_ipc_decode_envelope(frame, frame_size, &codec_config, &decoded),
+        CD_STATUS_SCHEMA_MISMATCH
+    );
+    frame[FRAME_OFFSET_VERSION] ^= 0x01u;
+
+    frame[FRAME_OFFSET_FLAGS] = 0x04u;
+    frame[FRAME_OFFSET_FLAGS + 1u] = 0x00u;
+    ASSERT_STATUS(
+        cd_ipc_decode_envelope(frame, frame_size, &codec_config, &decoded),
+        CD_STATUS_SCHEMA_MISMATCH
+    );
+    ASSERT_STATUS(
+        cd_ipc_encode_envelope(&message, &codec_config, frame, sizeof(frame), &frame_size),
+        CD_STATUS_OK
+    );
+
+    frame[FRAME_OFFSET_PAYLOAD_SIZE] = 0x05u;
+    frame[FRAME_OFFSET_PAYLOAD_SIZE + 1u] = 0x00u;
+    frame[FRAME_OFFSET_PAYLOAD_SIZE + 2u] = 0x00u;
+    frame[FRAME_OFFSET_PAYLOAD_SIZE + 3u] = 0x00u;
+    frame[FRAME_OFFSET_PAYLOAD_SIZE + 4u] = 0x00u;
+    frame[FRAME_OFFSET_PAYLOAD_SIZE + 5u] = 0x00u;
+    frame[FRAME_OFFSET_PAYLOAD_SIZE + 6u] = 0x00u;
+    frame[FRAME_OFFSET_PAYLOAD_SIZE + 7u] = 0x00u;
+    ASSERT_STATUS(
+        cd_ipc_decode_envelope(frame, frame_size, &codec_config, &decoded),
+        CD_STATUS_SCHEMA_MISMATCH
+    );
+
+    ASSERT_STATUS(
+        cd_ipc_encode_envelope(&message, &codec_config, frame, sizeof(frame), &frame_size),
+        CD_STATUS_OK
+    );
+    memset(&tiny_codec_config, 0, sizeof(tiny_codec_config));
+    tiny_codec_config.max_payload_size = 2u;
+    ASSERT_STATUS(
+        cd_ipc_decode_envelope(frame, frame_size, &tiny_codec_config, &decoded),
+        CD_STATUS_CAPACITY_REACHED
+    );
+
+    ASSERT_STATUS(
+        cd_ipc_decode_envelope(frame, CD_IPC_FRAME_HEADER_SIZE - 1u, &codec_config, &decoded),
+        CD_STATUS_SCHEMA_MISMATCH
+    );
+
+    return 0;
+}
+
 static int test_transport_attach_detach_validation(void)
 {
     cd_context_t *context;
@@ -1207,6 +1368,8 @@ int main(void)
     RUN_TEST(test_transport_attach_detach_validation);
     RUN_TEST(test_inproc_transport_event_routing_between_buses);
     RUN_TEST(test_inproc_transport_request_reply_between_buses);
+    RUN_TEST(test_ipc_codec_roundtrip);
+    RUN_TEST(test_ipc_codec_validation_guards);
     RUN_TEST(test_queue_and_argument_edges);
 
     return 0;
