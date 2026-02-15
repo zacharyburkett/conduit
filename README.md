@@ -11,6 +11,20 @@ It is designed to support two modes without changing module-level message logic:
 - Proposal: `docs/PROPOSAL.md`
 - Architecture: `docs/ARCHITECTURE.md`
 - Delivery plan: `docs/PROJECT_PLAN.md`
+- API contract: `docs/API_CONTRACT.md`
+
+## Build
+
+```sh
+cmake -S . -B build
+cmake --build build
+```
+
+## Test
+
+```sh
+ctest --test-dir build --output-on-failure
+```
 
 ## Direction Summary
 
