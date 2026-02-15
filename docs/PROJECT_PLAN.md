@@ -1,4 +1,16 @@
-# conduit Project Plan
+# Conduit Project Plan
+
+This is the implementation and hardening record for Conduit.
+
+## Status Snapshot
+
+- Core messaging model: complete.
+- Embedded sample + topic conventions: complete.
+- IPC socket transport: complete.
+- Broker routing and diagnostics: complete.
+- Load/stress harness + CI matrix: complete.
+- Thread-safety baseline and concurrency stress coverage: complete.
+- Optional future work remains for stricter CI enforcement and sanitizer pipelines.
 
 ## Vision
 

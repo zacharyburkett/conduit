@@ -1,6 +1,6 @@
 # Threading Contract (Phase 6 Start)
 
-This document defines current thread-safety guarantees for `conduit`.
+This document defines current thread-safety guarantees for Conduit.
 
 ## Current Guarantee
 

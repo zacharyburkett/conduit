@@ -1,4 +1,6 @@
-# conduit Proposal
+# Conduit Proposal
+
+This document captures the original design decision path for Conduit.
 
 ## Problem Statement
 

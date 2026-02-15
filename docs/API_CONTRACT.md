@@ -1,6 +1,15 @@
-# conduit API Contract (Phase 2)
+# Conduit API Contract
 
-This document freezes the initial API behavior and ownership rules for the scaffolding milestone.
+This is the behavioral contract for users of the public API.
+If behavior is not explicitly guaranteed here, treat it as unspecified.
+
+## Quick Reference
+
+- Event/command/request sends are enqueue operations.
+- Delivery happens during `cd_bus_pump`.
+- Request tokens are single-use terminal handles.
+- Reply payload returned by `cd_poll_reply` must be released with `cd_reply_dispose`.
+- Destroy is not concurrent-safe with active API calls.
 
 ## Threading Model
 

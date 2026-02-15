@@ -1,4 +1,6 @@
-# conduit Architecture
+# Conduit Architecture
+
+Use this document to understand how Conduit is structured internally and why.
 
 ## Repository Layout (Target)
 
