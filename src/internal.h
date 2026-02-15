@@ -24,6 +24,11 @@ typedef struct cd_subscription_entry {
     cd_subscription_desc_t desc;
 } cd_subscription_entry_t;
 
+typedef struct cd_dispatch_target {
+    size_t index;
+    cd_subscription_id_t subscription_id;
+} cd_dispatch_target_t;
+
 struct cd_bus {
     cd_context_t *context;
     cd_queued_message_t *queue;
@@ -32,6 +37,7 @@ struct cd_bus {
     size_t queue_count;
     cd_subscription_entry_t *subscriptions;
     size_t subscription_capacity;
+    cd_dispatch_target_t *dispatch_targets;
     cd_subscription_id_t next_subscription_id;
     cd_message_id_t next_message_id;
 };

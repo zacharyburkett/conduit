@@ -20,7 +20,9 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - `cd_publish` enqueues an event; delivery happens when `cd_bus_pump` is called.
 - Events are delivered to all subscribers that match topic and kind mask.
 - Commands are delivered to subscribers matching topic, kind mask, and target endpoint.
-- Subscription callback invocation order is registration order.
+- Subscription callback invocation order is deterministic by subscription registration id.
+- `cd_bus_pump` drains a stable queue snapshot taken at call start.
+- Messages published during callback execution are deferred to a later pump call.
 
 ## Status and Error Behavior
 

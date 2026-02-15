@@ -10,13 +10,19 @@ extern "C" {
 typedef struct cd_bus cd_bus_t;
 
 typedef struct cd_bus_config {
+    /* 0 uses implementation default. */
     size_t max_queued_messages;
+    /* 0 uses implementation default. */
     size_t max_subscriptions;
 } cd_bus_config_t;
 
 typedef cd_status_t (*cd_message_handler_fn)(void *user_data, const cd_envelope_t *message);
 
 typedef struct cd_subscription_desc {
+    /*
+     * Endpoint identity for this subscriber.
+     * Must be non-zero when subscribing to command/request/reply kinds.
+     */
     cd_endpoint_id_t endpoint;
     cd_topic_t topic;
     uint32_t kind_mask;
@@ -69,7 +75,11 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
 void cd_bus_destroy(cd_bus_t *bus);
 
 /*
- * Drain queued messages. max_messages == 0 drains all currently queued messages.
+ * Drain queued messages from a stable queue snapshot taken at pump start.
+ *
+ * max_messages == 0 drains the full snapshot.
+ * max_messages > 0 drains up to that many messages from the snapshot.
+ * Messages published during callback execution are left for a later pump.
  */
 cd_status_t cd_bus_pump(cd_bus_t *bus, size_t max_messages, size_t *out_processed);
 
