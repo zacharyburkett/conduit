@@ -29,11 +29,23 @@ static cd_message_id_t next_message_id(cd_bus_t *bus)
     cd_message_id_t id;
 
     id = bus->next_message_id++;
-    if (id == 0) {
+    if (id == 0u) {
         id = bus->next_message_id++;
     }
 
     return id;
+}
+
+static cd_request_token_t next_request_token(cd_bus_t *bus)
+{
+    cd_request_token_t token;
+
+    token = bus->next_request_token++;
+    if (token == 0u) {
+        token = bus->next_request_token++;
+    }
+
+    return token;
 }
 
 static bool subscription_matches_message(
@@ -145,9 +157,167 @@ static cd_status_t dispatch_message_to_subscribers(
     return current_status;
 }
 
+static void clear_inflight_request(cd_bus_t *bus, cd_inflight_request_t *request)
+{
+    if (request->reply_payload != NULL) {
+        cd_context_free(bus->context, request->reply_payload);
+    }
+    memset(request, 0, sizeof(*request));
+}
+
+static cd_inflight_request_t *find_inflight_request_by_token(cd_bus_t *bus, cd_request_token_t token)
+{
+    size_t i;
+
+    for (i = 0; i < bus->inflight_request_capacity; ++i) {
+        cd_inflight_request_t *request;
+
+        request = &bus->inflight_requests[i];
+        if (request->in_use && request->token == token) {
+            return request;
+        }
+    }
+
+    return NULL;
+}
+
+static cd_inflight_request_t *find_inflight_request_for_reply(
+    cd_bus_t *bus,
+    const cd_envelope_t *reply_envelope
+)
+{
+    size_t i;
+
+    for (i = 0; i < bus->inflight_request_capacity; ++i) {
+        cd_inflight_request_t *request;
+
+        request = &bus->inflight_requests[i];
+        if (!request->in_use || request->state != CD_REQUEST_WAITING) {
+            continue;
+        }
+        if (request->correlation_id != reply_envelope->correlation_id) {
+            continue;
+        }
+        if (reply_envelope->target_endpoint != CD_ENDPOINT_NONE &&
+            request->requester_endpoint != reply_envelope->target_endpoint) {
+            continue;
+        }
+        return request;
+    }
+
+    return NULL;
+}
+
+static cd_inflight_request_t *find_inflight_request_for_request_message(
+    cd_bus_t *bus,
+    const cd_envelope_t *request_envelope
+)
+{
+    size_t i;
+
+    for (i = 0; i < bus->inflight_request_capacity; ++i) {
+        cd_inflight_request_t *request;
+
+        request = &bus->inflight_requests[i];
+        if (!request->in_use) {
+            continue;
+        }
+        if (request->correlation_id != request_envelope->message_id) {
+            continue;
+        }
+        if (request->requester_endpoint != request_envelope->source_endpoint) {
+            continue;
+        }
+        return request;
+    }
+
+    return NULL;
+}
+
+static cd_inflight_request_t *find_free_inflight_request(cd_bus_t *bus)
+{
+    size_t i;
+
+    for (i = 0; i < bus->inflight_request_capacity; ++i) {
+        if (!bus->inflight_requests[i].in_use) {
+            return &bus->inflight_requests[i];
+        }
+    }
+
+    return NULL;
+}
+
+static uint64_t deadline_from_timeout(uint64_t now_ns, uint64_t timeout_ns)
+{
+    if (timeout_ns > UINT64_MAX - now_ns) {
+        return UINT64_MAX;
+    }
+    return now_ns + timeout_ns;
+}
+
+static void update_inflight_timeouts(cd_bus_t *bus)
+{
+    size_t i;
+    uint64_t now_ns;
+
+    now_ns = cd_context_now_ns(bus->context);
+    for (i = 0; i < bus->inflight_request_capacity; ++i) {
+        cd_inflight_request_t *request;
+
+        request = &bus->inflight_requests[i];
+        if (!request->in_use || request->state != CD_REQUEST_WAITING) {
+            continue;
+        }
+        if (now_ns >= request->expires_at_ns) {
+            request->state = CD_REQUEST_TIMED_OUT;
+        }
+    }
+}
+
+static cd_status_t capture_reply_for_inflight_request(
+    cd_bus_t *bus,
+    const cd_envelope_t *reply_envelope,
+    cd_status_t current_status
+)
+{
+    cd_inflight_request_t *request;
+    void *payload_copy;
+
+    request = find_inflight_request_for_reply(bus, reply_envelope);
+    if (request == NULL) {
+        return current_status;
+    }
+
+    payload_copy = NULL;
+    if (reply_envelope->payload_size > 0u) {
+        payload_copy = cd_context_alloc(bus->context, reply_envelope->payload_size);
+        if (payload_copy == NULL) {
+            if (current_status == CD_STATUS_OK) {
+                return CD_STATUS_ALLOCATION_FAILED;
+            }
+            return current_status;
+        }
+        memcpy(payload_copy, reply_envelope->payload, reply_envelope->payload_size);
+    }
+
+    if (request->reply_payload != NULL) {
+        cd_context_free(bus->context, request->reply_payload);
+    }
+
+    request->reply_payload = payload_copy;
+    request->reply_payload_size = reply_envelope->payload_size;
+    request->reply_message_id = reply_envelope->message_id;
+    request->reply_schema_id = reply_envelope->schema_id;
+    request->reply_schema_version = reply_envelope->schema_version;
+    request->state = CD_REQUEST_READY;
+
+    return current_status;
+}
+
 static cd_status_t enqueue_message(
     cd_bus_t *bus,
     cd_message_kind_t kind,
+    cd_message_id_t correlation_id,
     cd_endpoint_id_t source_endpoint,
     cd_endpoint_id_t target_endpoint,
     cd_topic_t topic,
@@ -189,7 +359,7 @@ static cd_status_t enqueue_message(
 
     slot->payload_copy = payload_copy;
     slot->envelope.message_id = next_message_id(bus);
-    slot->envelope.correlation_id = 0;
+    slot->envelope.correlation_id = correlation_id;
     slot->envelope.kind = kind;
     slot->envelope.topic = topic;
     slot->envelope.source_endpoint = source_endpoint;
@@ -215,9 +385,11 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
     cd_bus_t *bus;
     size_t queue_capacity;
     size_t subscription_capacity;
+    size_t inflight_request_capacity;
     size_t queue_alloc_size;
     size_t subscription_alloc_size;
     size_t dispatch_target_alloc_size;
+    size_t inflight_request_alloc_size;
 
     if (context == NULL || out_bus == NULL) {
         return CD_STATUS_INVALID_ARGUMENT;
@@ -226,6 +398,7 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
 
     queue_capacity = CD_DEFAULT_QUEUE_CAPACITY;
     subscription_capacity = CD_DEFAULT_SUBSCRIPTION_CAPACITY;
+    inflight_request_capacity = CD_DEFAULT_QUEUE_CAPACITY;
 
     if (config != NULL) {
         if (config->max_queued_messages > 0u) {
@@ -233,6 +406,9 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
         }
         if (config->max_subscriptions > 0u) {
             subscription_capacity = config->max_subscriptions;
+        }
+        if (config->max_inflight_requests > 0u) {
+            inflight_request_capacity = config->max_inflight_requests;
         }
     }
 
@@ -246,6 +422,11 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
             subscription_capacity,
             sizeof(*bus->dispatch_targets),
             &dispatch_target_alloc_size
+        ) ||
+        size_mul_overflow(
+            inflight_request_capacity,
+            sizeof(*bus->inflight_requests),
+            &inflight_request_alloc_size
         )) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
@@ -259,8 +440,10 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
     bus->context = context;
     bus->queue_capacity = queue_capacity;
     bus->subscription_capacity = subscription_capacity;
+    bus->inflight_request_capacity = inflight_request_capacity;
     bus->next_subscription_id = 1u;
     bus->next_message_id = 1u;
+    bus->next_request_token = 1u;
 
     bus->queue = (cd_queued_message_t *)cd_context_alloc(context, queue_alloc_size);
     if (bus->queue == NULL) {
@@ -286,6 +469,16 @@ cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, 
     }
     memset(bus->dispatch_targets, 0, dispatch_target_alloc_size);
 
+    bus->inflight_requests = (cd_inflight_request_t *)cd_context_alloc(context, inflight_request_alloc_size);
+    if (bus->inflight_requests == NULL) {
+        cd_context_free(context, bus->dispatch_targets);
+        cd_context_free(context, bus->subscriptions);
+        cd_context_free(context, bus->queue);
+        cd_context_free(context, bus);
+        return CD_STATUS_ALLOCATION_FAILED;
+    }
+    memset(bus->inflight_requests, 0, inflight_request_alloc_size);
+
     *out_bus = bus;
     return CD_STATUS_OK;
 }
@@ -305,6 +498,13 @@ void cd_bus_destroy(cd_bus_t *bus)
         }
     }
 
+    for (i = 0; i < bus->inflight_request_capacity; ++i) {
+        if (bus->inflight_requests[i].in_use) {
+            clear_inflight_request(bus, &bus->inflight_requests[i]);
+        }
+    }
+
+    cd_context_free(bus->context, bus->inflight_requests);
     cd_context_free(bus->context, bus->queue);
     cd_context_free(bus->context, bus->subscriptions);
     cd_context_free(bus->context, bus->dispatch_targets);
@@ -326,6 +526,8 @@ cd_status_t cd_bus_pump(cd_bus_t *bus, size_t max_messages, size_t *out_processe
         return CD_STATUS_INVALID_ARGUMENT;
     }
 
+    update_inflight_timeouts(bus);
+
     queue_snapshot_count = bus->queue_count;
     if (max_messages == 0u) {
         limit = queue_snapshot_count;
@@ -339,9 +541,31 @@ cd_status_t cd_bus_pump(cd_bus_t *bus, size_t max_messages, size_t *out_processe
     dispatch_status = CD_STATUS_OK;
     while (processed < limit && bus->queue_count > 0u) {
         cd_queued_message_t *message;
+        bool should_dispatch;
 
         message = &bus->queue[bus->queue_head];
-        dispatch_status = dispatch_message_to_subscribers(bus, &message->envelope, dispatch_status);
+        should_dispatch = true;
+
+        if (message->envelope.kind == CD_MESSAGE_REPLY) {
+            dispatch_status = capture_reply_for_inflight_request(
+                bus,
+                &message->envelope,
+                dispatch_status
+            );
+        } else if (message->envelope.kind == CD_MESSAGE_REQUEST) {
+            cd_inflight_request_t *request;
+
+            request = find_inflight_request_for_request_message(bus, &message->envelope);
+            if (request == NULL || request->state != CD_REQUEST_WAITING) {
+                should_dispatch = false;
+            }
+        }
+
+        if (should_dispatch && message->envelope.kind != CD_MESSAGE_REPLY) {
+            dispatch_status = dispatch_message_to_subscribers(bus, &message->envelope, dispatch_status);
+        } else {
+            /* Message intentionally dropped (stale request or internal reply handling). */
+        }
 
         if (message->payload_copy != NULL) {
             cd_context_free(bus->context, message->payload_copy);
@@ -352,6 +576,8 @@ cd_status_t cd_bus_pump(cd_bus_t *bus, size_t max_messages, size_t *out_processe
         bus->queue_count -= 1u;
         processed += 1u;
     }
+
+    update_inflight_timeouts(bus);
 
     if (out_processed != NULL) {
         *out_processed = processed;
@@ -373,6 +599,7 @@ cd_status_t cd_publish(cd_bus_t *bus, const cd_publish_params_t *params, cd_mess
     return enqueue_message(
         bus,
         CD_MESSAGE_EVENT,
+        0u,
         params->source_endpoint,
         CD_ENDPOINT_NONE,
         params->topic,
@@ -402,6 +629,7 @@ cd_status_t cd_send_command(
     return enqueue_message(
         bus,
         CD_MESSAGE_COMMAND,
+        0u,
         params->source_endpoint,
         params->target_endpoint,
         params->topic,
@@ -420,15 +648,88 @@ cd_status_t cd_request_async(
     cd_request_token_t *out_token
 )
 {
+    cd_message_id_t request_message_id;
+    cd_inflight_request_t *request_slot;
+    cd_status_t enqueue_status;
+    uint64_t now_ns;
+
     if (out_token != NULL) {
-        *out_token = 0;
+        *out_token = 0u;
     }
 
-    if (bus == NULL || params == NULL) {
+    if (bus == NULL || params == NULL || out_token == NULL ||
+        params->target_endpoint == CD_ENDPOINT_NONE || params->timeout_ns == 0u ||
+        (params->payload_size > 0u && params->payload == NULL)) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
 
-    return CD_STATUS_NOT_IMPLEMENTED;
+    update_inflight_timeouts(bus);
+    request_slot = find_free_inflight_request(bus);
+    if (request_slot == NULL) {
+        return CD_STATUS_CAPACITY_REACHED;
+    }
+
+    request_message_id = 0u;
+    enqueue_status = enqueue_message(
+        bus,
+        CD_MESSAGE_REQUEST,
+        0u,
+        params->source_endpoint,
+        params->target_endpoint,
+        params->topic,
+        params->schema_id,
+        params->schema_version,
+        params->flags,
+        params->payload,
+        params->payload_size,
+        &request_message_id
+    );
+    if (enqueue_status != CD_STATUS_OK) {
+        return enqueue_status;
+    }
+
+    now_ns = cd_context_now_ns(bus->context);
+    memset(request_slot, 0, sizeof(*request_slot));
+    request_slot->in_use = true;
+    request_slot->state = CD_REQUEST_WAITING;
+    request_slot->token = next_request_token(bus);
+    request_slot->correlation_id = request_message_id;
+    request_slot->requester_endpoint = params->source_endpoint;
+    request_slot->expires_at_ns = deadline_from_timeout(now_ns, params->timeout_ns);
+
+    *out_token = request_slot->token;
+    return CD_STATUS_OK;
+}
+
+cd_status_t cd_send_reply(
+    cd_bus_t *bus,
+    const cd_reply_params_t *params,
+    cd_message_id_t *out_message_id
+)
+{
+    if (out_message_id != NULL) {
+        *out_message_id = 0u;
+    }
+
+    if (bus == NULL || params == NULL || params->target_endpoint == CD_ENDPOINT_NONE ||
+        params->correlation_id == 0u || (params->payload_size > 0u && params->payload == NULL)) {
+        return CD_STATUS_INVALID_ARGUMENT;
+    }
+
+    return enqueue_message(
+        bus,
+        CD_MESSAGE_REPLY,
+        params->correlation_id,
+        params->source_endpoint,
+        params->target_endpoint,
+        params->topic,
+        params->schema_id,
+        params->schema_version,
+        params->flags,
+        params->payload,
+        params->payload_size,
+        out_message_id
+    );
 }
 
 cd_status_t cd_poll_reply(
@@ -438,19 +739,62 @@ cd_status_t cd_poll_reply(
     int *out_ready
 )
 {
+    cd_inflight_request_t *request;
+
     if (out_reply != NULL) {
         memset(out_reply, 0, sizeof(*out_reply));
     }
-    (void)token;
     if (out_ready != NULL) {
         *out_ready = 0;
     }
 
-    if (bus == NULL) {
+    if (bus == NULL || token == 0u) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
 
-    return CD_STATUS_NOT_IMPLEMENTED;
+    update_inflight_timeouts(bus);
+    request = find_inflight_request_by_token(bus, token);
+    if (request == NULL) {
+        return CD_STATUS_NOT_FOUND;
+    }
+
+    if (request->state == CD_REQUEST_WAITING) {
+        return CD_STATUS_OK;
+    }
+
+    if (out_ready != NULL) {
+        *out_ready = 1;
+    }
+
+    if (request->state == CD_REQUEST_TIMED_OUT) {
+        clear_inflight_request(bus, request);
+        return CD_STATUS_TIMEOUT;
+    }
+
+    if (out_reply != NULL) {
+        out_reply->message_id = request->reply_message_id;
+        out_reply->schema_id = request->reply_schema_id;
+        out_reply->schema_version = request->reply_schema_version;
+        out_reply->payload = request->reply_payload;
+        out_reply->payload_size = request->reply_payload_size;
+        request->reply_payload = NULL;
+        request->reply_payload_size = 0u;
+    }
+
+    clear_inflight_request(bus, request);
+    return CD_STATUS_OK;
+}
+
+void cd_reply_dispose(cd_bus_t *bus, cd_reply_t *reply)
+{
+    if (bus == NULL || reply == NULL) {
+        return;
+    }
+
+    if (reply->payload != NULL) {
+        cd_context_free(bus->context, (void *)reply->payload);
+    }
+    memset(reply, 0, sizeof(*reply));
 }
 
 cd_status_t cd_subscribe(

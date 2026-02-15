@@ -38,6 +38,10 @@ typedef struct test_runtime {
     cd_bus_t *bus;
 } test_runtime_t;
 
+typedef struct fake_clock {
+    uint64_t now_ns;
+} fake_clock_t;
+
 typedef struct capture_state {
     int count;
     int markers[64];
@@ -56,13 +60,37 @@ typedef struct handler_state {
     int republished;
 } handler_state_t;
 
+typedef struct request_replier_state {
+    cd_bus_t *bus;
+    int request_hits;
+    cd_message_id_t last_request_message_id;
+    cd_message_id_t last_reply_message_id;
+    char last_payload[32];
+    const char *reply_payload;
+    size_t reply_payload_size;
+} request_replier_state_t;
+
 static void test_free_adapter(void *user_data, void *ptr)
 {
     (void)user_data;
     free(ptr);
 }
 
-static int setup_runtime(size_t max_queued_messages, size_t max_subscriptions, test_runtime_t *runtime)
+static uint64_t test_fake_now_ns(void *user_data)
+{
+    fake_clock_t *clock;
+
+    clock = (fake_clock_t *)user_data;
+    return clock->now_ns;
+}
+
+static int setup_runtime_full(
+    size_t max_queued_messages,
+    size_t max_subscriptions,
+    size_t max_inflight_requests,
+    const cd_context_config_t *context_config,
+    test_runtime_t *runtime
+)
 {
     cd_bus_config_t bus_config;
 
@@ -72,14 +100,42 @@ static int setup_runtime(size_t max_queued_messages, size_t max_subscriptions, t
 
     runtime->context = NULL;
     runtime->bus = NULL;
-    ASSERT_STATUS(cd_context_init(&runtime->context, NULL), CD_STATUS_OK);
+    ASSERT_STATUS(cd_context_init(&runtime->context, context_config), CD_STATUS_OK);
 
     memset(&bus_config, 0, sizeof(bus_config));
     bus_config.max_queued_messages = max_queued_messages;
     bus_config.max_subscriptions = max_subscriptions;
+    bus_config.max_inflight_requests = max_inflight_requests;
     ASSERT_STATUS(cd_bus_create(runtime->context, &bus_config, &runtime->bus), CD_STATUS_OK);
 
     return 0;
+}
+
+static int setup_runtime(size_t max_queued_messages, size_t max_subscriptions, test_runtime_t *runtime)
+{
+    return setup_runtime_full(max_queued_messages, max_subscriptions, 0u, NULL, runtime);
+}
+
+static int setup_runtime_with_clock(
+    size_t max_queued_messages,
+    size_t max_subscriptions,
+    size_t max_inflight_requests,
+    fake_clock_t *clock,
+    test_runtime_t *runtime
+)
+{
+    cd_context_config_t context_config;
+
+    memset(&context_config, 0, sizeof(context_config));
+    context_config.clock.now_ns = test_fake_now_ns;
+    context_config.clock.user_data = clock;
+    return setup_runtime_full(
+        max_queued_messages,
+        max_subscriptions,
+        max_inflight_requests,
+        &context_config,
+        runtime
+    );
 }
 
 static void teardown_runtime(test_runtime_t *runtime)
@@ -135,6 +191,51 @@ static cd_status_t generic_handler(void *user_data, const cd_envelope_t *message
     }
 
     return state->return_status;
+}
+
+static cd_status_t request_replier_handler(void *user_data, const cd_envelope_t *message)
+{
+    request_replier_state_t *state;
+    cd_reply_params_t reply_params;
+    cd_message_id_t reply_message_id;
+    cd_status_t send_status;
+    size_t payload_len;
+
+    state = (request_replier_state_t *)user_data;
+    if (state == NULL || message == NULL || message->kind != CD_MESSAGE_REQUEST || state->bus == NULL) {
+        return CD_STATUS_INVALID_ARGUMENT;
+    }
+
+    state->request_hits += 1;
+    state->last_request_message_id = message->message_id;
+    memset(state->last_payload, 0, sizeof(state->last_payload));
+    payload_len = message->payload_size;
+    if (payload_len > sizeof(state->last_payload) - 1u) {
+        payload_len = sizeof(state->last_payload) - 1u;
+    }
+    if (payload_len > 0u && message->payload != NULL) {
+        memcpy(state->last_payload, message->payload, payload_len);
+    }
+
+    memset(&reply_params, 0, sizeof(reply_params));
+    reply_params.source_endpoint = message->target_endpoint;
+    reply_params.target_endpoint = message->source_endpoint;
+    reply_params.correlation_id = message->message_id;
+    reply_params.topic = message->topic;
+    reply_params.schema_id = 9001u;
+    reply_params.schema_version = 1u;
+    reply_params.flags = CD_MESSAGE_FLAG_LOCAL_ONLY;
+    reply_params.payload = state->reply_payload;
+    reply_params.payload_size = state->reply_payload_size;
+
+    reply_message_id = 0u;
+    send_status = cd_send_reply(state->bus, &reply_params, &reply_message_id);
+    if (send_status != CD_STATUS_OK) {
+        return send_status;
+    }
+    state->last_reply_message_id = reply_message_id;
+
+    return CD_STATUS_OK;
 }
 
 static int test_basic_event_delivery_and_payload_copy(void)
@@ -547,18 +648,206 @@ static int test_pump_returns_first_callback_error(void)
     return 0;
 }
 
+static int test_request_reply_roundtrip_and_dispose(void)
+{
+    test_runtime_t runtime;
+    cd_subscription_desc_t sub;
+    request_replier_state_t replier_state;
+    cd_request_params_t request;
+    cd_request_token_t token;
+    size_t processed;
+    int ready;
+    cd_reply_t reply;
+
+    ASSERT_TRUE(setup_runtime_full(8u, 8u, 8u, NULL, &runtime) == 0);
+
+    memset(&replier_state, 0, sizeof(replier_state));
+    replier_state.bus = runtime.bus;
+    replier_state.reply_payload = "reply-ok";
+    replier_state.reply_payload_size = strlen("reply-ok");
+
+    memset(&sub, 0, sizeof(sub));
+    sub.endpoint = 50u;
+    sub.topic = 120u;
+    sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_REQUEST);
+    sub.handler = request_replier_handler;
+    sub.user_data = &replier_state;
+    ASSERT_STATUS(cd_subscribe(runtime.bus, &sub, NULL), CD_STATUS_OK);
+
+    memset(&request, 0, sizeof(request));
+    request.source_endpoint = 1u;
+    request.target_endpoint = 50u;
+    request.topic = 120u;
+    request.schema_id = 100u;
+    request.schema_version = 1u;
+    request.flags = CD_MESSAGE_FLAG_LOCAL_ONLY;
+    request.timeout_ns = 1000000000ull;
+    request.payload = "ask";
+    request.payload_size = 3u;
+
+    token = 0u;
+    ASSERT_STATUS(cd_request_async(runtime.bus, &request, &token), CD_STATUS_OK);
+    ASSERT_TRUE(token != 0u);
+
+    ready = -1;
+    memset(&reply, 0, sizeof(reply));
+    ASSERT_STATUS(cd_poll_reply(runtime.bus, token, &reply, &ready), CD_STATUS_OK);
+    ASSERT_TRUE(ready == 0);
+
+    processed = 0u;
+    ASSERT_STATUS(cd_bus_pump(runtime.bus, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(processed == 1u);
+    ASSERT_TRUE(replier_state.request_hits == 1);
+    ASSERT_TRUE(strcmp(replier_state.last_payload, "ask") == 0);
+
+    ready = -1;
+    memset(&reply, 0, sizeof(reply));
+    ASSERT_STATUS(cd_poll_reply(runtime.bus, token, &reply, &ready), CD_STATUS_OK);
+    ASSERT_TRUE(ready == 0);
+
+    processed = 0u;
+    ASSERT_STATUS(cd_bus_pump(runtime.bus, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(processed == 1u);
+
+    ready = -1;
+    memset(&reply, 0, sizeof(reply));
+    ASSERT_STATUS(cd_poll_reply(runtime.bus, token, &reply, &ready), CD_STATUS_OK);
+    ASSERT_TRUE(ready == 1);
+    ASSERT_TRUE(reply.message_id == replier_state.last_reply_message_id);
+    ASSERT_TRUE(reply.payload != NULL);
+    ASSERT_TRUE(reply.payload_size == replier_state.reply_payload_size);
+    ASSERT_TRUE(strncmp((const char *)reply.payload, "reply-ok", reply.payload_size) == 0);
+
+    cd_reply_dispose(runtime.bus, &reply);
+    ASSERT_TRUE(reply.payload == NULL);
+    ASSERT_TRUE(reply.payload_size == 0u);
+
+    ready = -1;
+    ASSERT_STATUS(cd_poll_reply(runtime.bus, token, NULL, &ready), CD_STATUS_NOT_FOUND);
+
+    teardown_runtime(&runtime);
+    return 0;
+}
+
+static int test_request_timeout_with_fake_clock(void)
+{
+    test_runtime_t runtime;
+    fake_clock_t clock;
+    cd_request_params_t request;
+    cd_subscription_desc_t sub;
+    capture_state_t capture;
+    handler_state_t handler;
+    cd_request_token_t token;
+    size_t processed;
+    int ready;
+    cd_reply_t reply;
+
+    memset(&clock, 0, sizeof(clock));
+    clock.now_ns = 1000u;
+    ASSERT_TRUE(setup_runtime_with_clock(8u, 8u, 8u, &clock, &runtime) == 0);
+
+    memset(&request, 0, sizeof(request));
+    request.source_endpoint = 1u;
+    request.target_endpoint = 77u;
+    request.topic = 333u;
+    request.timeout_ns = 50u;
+    request.payload = "timeout";
+    request.payload_size = 7u;
+    ASSERT_STATUS(cd_request_async(runtime.bus, &request, &token), CD_STATUS_OK);
+
+    ready = -1;
+    ASSERT_STATUS(cd_poll_reply(runtime.bus, token, NULL, &ready), CD_STATUS_OK);
+    ASSERT_TRUE(ready == 0);
+
+    clock.now_ns = 1049u;
+    ASSERT_STATUS(cd_poll_reply(runtime.bus, token, NULL, &ready), CD_STATUS_OK);
+    ASSERT_TRUE(ready == 0);
+
+    clock.now_ns = 1050u;
+    memset(&reply, 0xAB, sizeof(reply));
+    ASSERT_STATUS(cd_poll_reply(runtime.bus, token, &reply, &ready), CD_STATUS_TIMEOUT);
+    ASSERT_TRUE(ready == 1);
+    ASSERT_TRUE(reply.message_id == 0u);
+    ASSERT_TRUE(reply.payload == NULL);
+
+    memset(&capture, 0, sizeof(capture));
+    memset(&handler, 0, sizeof(handler));
+    handler.capture = &capture;
+    handler.marker = 9;
+    handler.return_status = CD_STATUS_OK;
+    memset(&sub, 0, sizeof(sub));
+    sub.endpoint = 77u;
+    sub.topic = 333u;
+    sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_REQUEST);
+    sub.handler = generic_handler;
+    sub.user_data = &handler;
+    ASSERT_STATUS(cd_subscribe(runtime.bus, &sub, NULL), CD_STATUS_OK);
+
+    processed = 0u;
+    ASSERT_STATUS(cd_bus_pump(runtime.bus, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(processed == 1u);
+    ASSERT_TRUE(capture.count == 0);
+
+    ASSERT_STATUS(cd_poll_reply(runtime.bus, token, NULL, &ready), CD_STATUS_NOT_FOUND);
+
+    teardown_runtime(&runtime);
+    return 0;
+}
+
+static int test_request_inflight_capacity_and_validation(void)
+{
+    test_runtime_t runtime;
+    cd_request_params_t request;
+    cd_request_token_t token_1;
+    cd_request_token_t token_2;
+
+    ASSERT_TRUE(setup_runtime_full(8u, 8u, 1u, NULL, &runtime) == 0);
+
+    memset(&request, 0, sizeof(request));
+    request.source_endpoint = 1u;
+    request.target_endpoint = 2u;
+    request.topic = 7u;
+    request.timeout_ns = 1000u;
+
+    token_1 = 0u;
+    ASSERT_STATUS(cd_request_async(runtime.bus, &request, &token_1), CD_STATUS_OK);
+    ASSERT_TRUE(token_1 != 0u);
+
+    token_2 = 0u;
+    ASSERT_STATUS(cd_request_async(runtime.bus, &request, &token_2), CD_STATUS_CAPACITY_REACHED);
+    ASSERT_TRUE(token_2 == 0u);
+
+    request.target_endpoint = CD_ENDPOINT_NONE;
+    ASSERT_STATUS(cd_request_async(runtime.bus, &request, &token_2), CD_STATUS_INVALID_ARGUMENT);
+
+    request.target_endpoint = 2u;
+    request.timeout_ns = 0u;
+    ASSERT_STATUS(cd_request_async(runtime.bus, &request, &token_2), CD_STATUS_INVALID_ARGUMENT);
+
+    request.timeout_ns = 1000u;
+    request.payload = NULL;
+    request.payload_size = 1u;
+    ASSERT_STATUS(cd_request_async(runtime.bus, &request, &token_2), CD_STATUS_INVALID_ARGUMENT);
+
+    ASSERT_STATUS(cd_request_async(runtime.bus, &request, NULL), CD_STATUS_INVALID_ARGUMENT);
+
+    teardown_runtime(&runtime);
+    return 0;
+}
+
 static int test_queue_and_argument_edges(void)
 {
     test_runtime_t runtime;
     cd_publish_params_t publish;
     cd_command_params_t command;
     cd_request_params_t request;
+    cd_reply_params_t reply_params;
     cd_reply_t reply;
     cd_request_token_t token;
     cd_message_id_t invalid_message_id;
     size_t processed;
 
-    ASSERT_TRUE(setup_runtime(1u, 4u, &runtime) == 0);
+    ASSERT_TRUE(setup_runtime_full(1u, 4u, 2u, NULL, &runtime) == 0);
 
     memset(&publish, 0, sizeof(publish));
     publish.source_endpoint = 1u;
@@ -574,6 +863,15 @@ static int test_queue_and_argument_edges(void)
     ASSERT_STATUS(cd_publish(runtime.bus, &publish, NULL), CD_STATUS_OK);
     ASSERT_STATUS(cd_publish(runtime.bus, &publish, NULL), CD_STATUS_QUEUE_FULL);
 
+    memset(&request, 0, sizeof(request));
+    request.source_endpoint = 1u;
+    request.target_endpoint = 2u;
+    request.topic = 8u;
+    request.timeout_ns = 1000u;
+    token = 88u;
+    ASSERT_STATUS(cd_request_async(runtime.bus, &request, &token), CD_STATUS_QUEUE_FULL);
+    ASSERT_TRUE(token == 0u);
+
     ASSERT_STATUS(cd_bus_pump(runtime.bus, 0u, NULL), CD_STATUS_OK);
 
     memset(&command, 0, sizeof(command));
@@ -584,33 +882,41 @@ static int test_queue_and_argument_edges(void)
     ASSERT_STATUS(cd_send_command(runtime.bus, &command, &invalid_message_id), CD_STATUS_INVALID_ARGUMENT);
     ASSERT_TRUE(invalid_message_id == 0u);
 
+    memset(&reply_params, 0, sizeof(reply_params));
+    reply_params.source_endpoint = 2u;
+    reply_params.target_endpoint = CD_ENDPOINT_NONE;
+    reply_params.correlation_id = 1u;
+    ASSERT_STATUS(cd_send_reply(runtime.bus, &reply_params, NULL), CD_STATUS_INVALID_ARGUMENT);
+
+    reply_params.target_endpoint = 1u;
+    reply_params.correlation_id = 0u;
+    ASSERT_STATUS(cd_send_reply(runtime.bus, &reply_params, NULL), CD_STATUS_INVALID_ARGUMENT);
+
     ASSERT_STATUS(cd_bus_pump(NULL, 0u, NULL), CD_STATUS_INVALID_ARGUMENT);
     ASSERT_STATUS(cd_publish(NULL, &publish, NULL), CD_STATUS_INVALID_ARGUMENT);
     ASSERT_STATUS(cd_send_command(NULL, &command, NULL), CD_STATUS_INVALID_ARGUMENT);
-
-    memset(&request, 0, sizeof(request));
-    request.source_endpoint = 1u;
-    request.target_endpoint = 2u;
-    request.topic = 8u;
-    request.timeout_ns = 1000u;
+    ASSERT_STATUS(cd_send_reply(NULL, &reply_params, NULL), CD_STATUS_INVALID_ARGUMENT);
 
     token = 99u;
     ASSERT_STATUS(cd_request_async(NULL, &request, &token), CD_STATUS_INVALID_ARGUMENT);
     ASSERT_TRUE(token == 0u);
     ASSERT_STATUS(cd_request_async(runtime.bus, NULL, &token), CD_STATUS_INVALID_ARGUMENT);
     ASSERT_TRUE(token == 0u);
-    ASSERT_STATUS(cd_request_async(runtime.bus, &request, &token), CD_STATUS_NOT_IMPLEMENTED);
-    ASSERT_TRUE(token == 0u);
 
     memset(&reply, 0xAB, sizeof(reply));
     ASSERT_STATUS(cd_poll_reply(NULL, 1u, &reply, NULL), CD_STATUS_INVALID_ARGUMENT);
     ASSERT_TRUE(reply.message_id == 0u);
-    ASSERT_STATUS(cd_poll_reply(runtime.bus, 1u, &reply, NULL), CD_STATUS_NOT_IMPLEMENTED);
+    ASSERT_STATUS(cd_poll_reply(runtime.bus, 0u, &reply, NULL), CD_STATUS_INVALID_ARGUMENT);
+    ASSERT_TRUE(reply.message_id == 0u);
+    ASSERT_STATUS(cd_poll_reply(runtime.bus, 123456u, &reply, NULL), CD_STATUS_NOT_FOUND);
     ASSERT_TRUE(reply.message_id == 0u);
 
     processed = 123u;
     ASSERT_STATUS(cd_bus_pump(runtime.bus, 0u, &processed), CD_STATUS_OK);
     ASSERT_TRUE(processed == 0u);
+
+    cd_reply_dispose(NULL, &reply);
+    cd_reply_dispose(runtime.bus, NULL);
 
     teardown_runtime(&runtime);
     return 0;
@@ -653,6 +959,9 @@ int main(void)
     RUN_TEST(test_pump_limit_and_message_id_order);
     RUN_TEST(test_subscription_capacity_and_validation);
     RUN_TEST(test_pump_returns_first_callback_error);
+    RUN_TEST(test_request_reply_roundtrip_and_dispose);
+    RUN_TEST(test_request_timeout_with_fake_clock);
+    RUN_TEST(test_request_inflight_capacity_and_validation);
     RUN_TEST(test_queue_and_argument_edges);
 
     return 0;

@@ -1,4 +1,4 @@
-# conduit API Contract (Phase 0)
+# conduit API Contract (Phase 2)
 
 This document freezes the initial API behavior and ownership rules for the scaffolding milestone.
 
@@ -6,7 +6,7 @@ This document freezes the initial API behavior and ownership rules for the scaff
 
 - Current implementation is single-threaded at bus dispatch.
 - `cd_bus_pump` must be called from one thread at a time.
-- Concurrent publish/subscribe is not yet guaranteed thread-safe in Phase 0.
+- Concurrent publish/subscribe is not yet guaranteed thread-safe.
 
 ## Memory Ownership
 
@@ -15,7 +15,7 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - Subscriber callbacks receive read-only payload pointers (`cd_envelope_t.payload`).
 - Message payload memory is released by the bus after dispatch completes.
 
-## Delivery Semantics (Phase 0)
+## Delivery Semantics (Current)
 
 - `cd_publish` enqueues an event; delivery happens when `cd_bus_pump` is called.
 - Events are delivered to all subscribers that match topic and kind mask.
@@ -23,17 +23,32 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - Subscription callback invocation order is deterministic by subscription registration id.
 - `cd_bus_pump` drains a stable queue snapshot taken at call start.
 - Messages published during callback execution are deferred to a later pump call.
+- Requests are directed messages routed to the target endpoint.
+- Replies are correlated through `correlation_id` (request `message_id`) and
+  stored in the requester's inflight mailbox.
 
 ## Status and Error Behavior
 
 - `CD_STATUS_INVALID_ARGUMENT`: null pointers or invalid required fields.
 - `CD_STATUS_ALLOCATION_FAILED`: memory allocation failure.
 - `CD_STATUS_QUEUE_FULL`: enqueue attempt beyond queue capacity.
-- `CD_STATUS_CAPACITY_REACHED`: subscription table full.
+- `CD_STATUS_CAPACITY_REACHED`: subscription or inflight-request table full.
 - `CD_STATUS_NOT_FOUND`: unsubscribe unknown subscription id.
-- `CD_STATUS_NOT_IMPLEMENTED`: request/reply APIs in this phase.
+- `CD_STATUS_TIMEOUT`: request expired before a matching reply was captured.
+
+## Request/Reply Semantics
+
+- `cd_request_async` enqueues a `CD_MESSAGE_REQUEST` and returns a request token.
+- `cd_send_reply` enqueues `CD_MESSAGE_REPLY` with request correlation id.
+- Inflight request capacity is bounded by `cd_bus_config_t.max_inflight_requests`.
+- `cd_poll_reply` is terminal for a request token:
+  - `CD_STATUS_OK` + `out_ready=0`: still waiting
+  - `CD_STATUS_OK` + `out_ready=1`: reply ready and token consumed
+  - `CD_STATUS_TIMEOUT` + `out_ready=1`: timed out and token consumed
+  - `CD_STATUS_NOT_FOUND`: token does not exist/already consumed
+- Reply payload returned by `cd_poll_reply` must be released with
+  `cd_reply_dispose`.
 
 ## Phase Boundaries
 
-- Request/reply (`cd_request_async`, `cd_poll_reply`) is reserved for Phase 2.
 - Transport adapters are reserved for later milestones.

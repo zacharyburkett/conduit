@@ -14,6 +14,8 @@ typedef struct cd_bus_config {
     size_t max_queued_messages;
     /* 0 uses implementation default. */
     size_t max_subscriptions;
+    /* 0 uses implementation default. */
+    size_t max_inflight_requests;
 } cd_bus_config_t;
 
 typedef cd_status_t (*cd_message_handler_fn)(void *user_data, const cd_envelope_t *message);
@@ -63,6 +65,18 @@ typedef struct cd_request_params {
     size_t payload_size;
 } cd_request_params_t;
 
+typedef struct cd_reply_params {
+    cd_endpoint_id_t source_endpoint;
+    cd_endpoint_id_t target_endpoint;
+    cd_message_id_t correlation_id;
+    cd_topic_t topic;
+    uint32_t schema_id;
+    uint16_t schema_version;
+    uint16_t flags;
+    const void *payload;
+    size_t payload_size;
+} cd_reply_params_t;
+
 typedef struct cd_reply {
     cd_message_id_t message_id;
     uint32_t schema_id;
@@ -91,17 +105,29 @@ cd_status_t cd_send_command(
     cd_message_id_t *out_message_id
 );
 
-/*
- * Reserved API for Phase 2. Currently returns CD_STATUS_NOT_IMPLEMENTED.
- */
 cd_status_t cd_request_async(
     cd_bus_t *bus,
     const cd_request_params_t *params,
     cd_request_token_t *out_token
 );
 
+cd_status_t cd_send_reply(
+    cd_bus_t *bus,
+    const cd_reply_params_t *params,
+    cd_message_id_t *out_message_id
+);
+
 /*
- * Reserved API for Phase 2. Currently returns CD_STATUS_NOT_IMPLEMENTED.
+ * Polls request status by token.
+ *
+ * Returns:
+ * - CD_STATUS_OK with out_ready=0 when still waiting.
+ * - CD_STATUS_OK with out_ready=1 and out_reply set when reply arrived.
+ * - CD_STATUS_TIMEOUT with out_ready=1 when request expired.
+ * - CD_STATUS_NOT_FOUND for unknown token.
+ *
+ * When out_reply is provided and a reply is ready, payload is copied into
+ * bus-owned allocation and must be released with cd_reply_dispose.
  */
 cd_status_t cd_poll_reply(
     cd_bus_t *bus,
@@ -109,6 +135,12 @@ cd_status_t cd_poll_reply(
     cd_reply_t *out_reply,
     int *out_ready
 );
+
+/*
+ * Releases payload memory returned by cd_poll_reply.
+ * Safe to call with zeroed/empty replies.
+ */
+void cd_reply_dispose(cd_bus_t *bus, cd_reply_t *reply);
 
 cd_status_t cd_subscribe(
     cd_bus_t *bus,
