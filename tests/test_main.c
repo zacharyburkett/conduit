@@ -2603,6 +2603,101 @@ static int test_ipc_socket_transport_request_reply_between_buses(void)
     return 0;
 }
 
+static int test_ipc_socket_transport_concurrent_request_reply_ownership(void)
+{
+    enum {
+        REQUEST_THREAD_COUNT = 4,
+        REQUESTS_PER_THREAD = 200
+    };
+
+    cd_context_t *context;
+    cd_bus_t *bus_a;
+    cd_bus_t *bus_b;
+    cd_bus_config_t bus_config;
+    cd_transport_t transport_a;
+    cd_transport_t transport_b;
+    cd_subscription_desc_t request_sub;
+    request_echo_replier_state_t replier_state;
+    pump_thread_args_t pump_args;
+    pthread_t pump_thread;
+    request_thread_args_t request_args[REQUEST_THREAD_COUNT];
+    pthread_t request_threads[REQUEST_THREAD_COUNT];
+    int sockets[2];
+    int i;
+
+    context = NULL;
+    bus_a = NULL;
+    bus_b = NULL;
+    sockets[0] = -1;
+    sockets[1] = -1;
+    memset(&transport_a, 0, sizeof(transport_a));
+    memset(&transport_b, 0, sizeof(transport_b));
+    memset(&replier_state, 0, sizeof(replier_state));
+    memset(&pump_args, 0, sizeof(pump_args));
+    memset(request_args, 0, sizeof(request_args));
+    memset(request_threads, 0, sizeof(request_threads));
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 8192u;
+    bus_config.max_subscriptions = 16u;
+    bus_config.max_inflight_requests = 4096u;
+    bus_config.max_transports = 1u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_b), CD_STATUS_OK);
+
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, sockets[0], NULL, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, sockets[1], NULL, &transport_b), CD_STATUS_OK);
+    sockets[0] = -1;
+    sockets[1] = -1;
+
+    ASSERT_STATUS(cd_bus_attach_transport(bus_a, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_attach_transport(bus_b, &transport_b), CD_STATUS_OK);
+
+    replier_state.bus = bus_b;
+    memset(&request_sub, 0, sizeof(request_sub));
+    request_sub.endpoint = 901u;
+    request_sub.topic = 0x00C10001u;
+    request_sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_REQUEST);
+    request_sub.handler = request_echo_replier_handler;
+    request_sub.user_data = &replier_state;
+    ASSERT_STATUS(cd_subscribe(bus_b, &request_sub, NULL), CD_STATUS_OK);
+
+    pump_args.bus_a = bus_a;
+    pump_args.bus_b = bus_b;
+    atomic_init(&pump_args.stop, 0);
+    pump_args.failures = 0;
+    ASSERT_TRUE(pthread_create(&pump_thread, NULL, pump_pair_thread_main, &pump_args) == 0);
+
+    for (i = 0; i < REQUEST_THREAD_COUNT; ++i) {
+        request_args[i].request_bus = bus_a;
+        request_args[i].thread_index = i;
+        request_args[i].request_count = REQUESTS_PER_THREAD;
+        request_args[i].failures = 0;
+        ASSERT_TRUE(pthread_create(&request_threads[i], NULL, request_thread_main, &request_args[i]) == 0);
+    }
+
+    for (i = 0; i < REQUEST_THREAD_COUNT; ++i) {
+        ASSERT_TRUE(pthread_join(request_threads[i], NULL) == 0);
+        ASSERT_TRUE(request_args[i].failures == 0);
+    }
+
+    atomic_store_explicit(&pump_args.stop, 1, memory_order_release);
+    ASSERT_TRUE(pthread_join(pump_thread, NULL) == 0);
+    ASSERT_TRUE(pump_args.failures == 0);
+
+    ASSERT_TRUE(replier_state.request_hits == (REQUEST_THREAD_COUNT * REQUESTS_PER_THREAD));
+
+    cd_ipc_socket_transport_close(&transport_a);
+    cd_ipc_socket_transport_close(&transport_b);
+    cd_bus_destroy(bus_a);
+    cd_bus_destroy(bus_b);
+    cd_context_shutdown(context);
+    return 0;
+}
+
 static int test_ipc_socket_transport_protocol_mismatch_path(void)
 {
     cd_context_t *context;
@@ -4176,6 +4271,7 @@ int main(void)
     RUN_TEST(test_inproc_transport_request_reply_between_buses);
     RUN_TEST(test_ipc_socket_transport_event_routing_between_buses);
     RUN_TEST(test_ipc_socket_transport_request_reply_between_buses);
+    RUN_TEST(test_ipc_socket_transport_concurrent_request_reply_ownership);
     RUN_TEST(test_ipc_socket_transport_protocol_mismatch_path);
     RUN_TEST(test_ipc_socket_transport_disconnect_paths);
     RUN_TEST(test_ipc_socket_transport_forked_two_process_roundtrip);

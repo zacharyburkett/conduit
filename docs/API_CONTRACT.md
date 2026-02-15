@@ -7,6 +7,8 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - Bus internals are protected by an internal recursive mutex.
 - In-process transport hub queues are protected by an internal mutex for
   concurrent `send`/`poll` paths.
+- IPC socket transport RX/TX state is protected by an internal mutex for
+  concurrent `send`/`poll`/`flush` paths.
 - Bus APIs are thread-safe for concurrent calls, except destroy lifecycle:
   - `cd_bus_destroy` must not race with other bus API calls.
 - `cd_bus_pump` remains single-consumer dispatch semantics:

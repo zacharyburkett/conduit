@@ -26,6 +26,7 @@ enum {
 
 typedef struct cd_ipc_socket_transport_impl {
     cd_context_t *context;
+    cd_mutex_t *lock;
     int socket_fd;
     bool close_socket_on_shutdown;
     cd_ipc_codec_config_t codec_config;
@@ -43,6 +44,20 @@ typedef enum cd_ipc_io_result {
     CD_IPC_IO_WOULD_BLOCK = 1,
     CD_IPC_IO_FAILED = 2
 } cd_ipc_io_result_t;
+
+static void ipc_socket_lock(cd_ipc_socket_transport_impl_t *state)
+{
+    if (state != NULL && state->lock != NULL) {
+        cd_mutex_lock(state->lock);
+    }
+}
+
+static void ipc_socket_unlock(cd_ipc_socket_transport_impl_t *state)
+{
+    if (state != NULL && state->lock != NULL) {
+        cd_mutex_unlock(state->lock);
+    }
+}
 
 static bool size_add_overflow(size_t a, size_t b, size_t *out_result)
 {
@@ -246,12 +261,16 @@ static cd_status_t ipc_socket_send(void *impl, const cd_envelope_t *message)
         return CD_STATUS_INVALID_ARGUMENT;
     }
 
+    ipc_socket_lock(state);
+
     if (state->tx_size > 0u) {
         io_result = flush_pending_bytes(state);
         if (io_result == CD_IPC_IO_FAILED) {
+            ipc_socket_unlock(state);
             return CD_STATUS_TRANSPORT_UNAVAILABLE;
         }
         if (io_result == CD_IPC_IO_WOULD_BLOCK) {
+            ipc_socket_unlock(state);
             return CD_STATUS_CAPACITY_REACHED;
         }
     }
@@ -266,6 +285,7 @@ static cd_status_t ipc_socket_send(void *impl, const cd_envelope_t *message)
     if (status != CD_STATUS_OK) {
         state->tx_size = 0u;
         state->tx_offset = 0u;
+        ipc_socket_unlock(state);
         return status;
     }
     state->tx_offset = 0u;
@@ -274,12 +294,15 @@ static cd_status_t ipc_socket_send(void *impl, const cd_envelope_t *message)
     if (io_result == CD_IPC_IO_FAILED) {
         state->tx_size = 0u;
         state->tx_offset = 0u;
+        ipc_socket_unlock(state);
         return CD_STATUS_TRANSPORT_UNAVAILABLE;
     }
     if (io_result == CD_IPC_IO_WOULD_BLOCK) {
+        ipc_socket_unlock(state);
         return CD_STATUS_OK;
     }
 
+    ipc_socket_unlock(state);
     return CD_STATUS_OK;
 }
 
@@ -305,6 +328,8 @@ static cd_status_t ipc_socket_poll(
         return CD_STATUS_INVALID_ARGUMENT;
     }
 
+    ipc_socket_lock(state);
+
     limit = max_messages;
     if (limit == 0u) {
         limit = SIZE_MAX;
@@ -313,6 +338,7 @@ static cd_status_t ipc_socket_poll(
 
     io_result = flush_pending_bytes(state);
     if (io_result == CD_IPC_IO_FAILED) {
+        ipc_socket_unlock(state);
         return CD_STATUS_TRANSPORT_UNAVAILABLE;
     }
 
@@ -328,6 +354,7 @@ static cd_status_t ipc_socket_poll(
                 if (out_polled_count != NULL) {
                     *out_polled_count = processed;
                 }
+                ipc_socket_unlock(state);
                 return status;
             }
             if (!delivered) {
@@ -344,6 +371,7 @@ static cd_status_t ipc_socket_poll(
             if (out_polled_count != NULL) {
                 *out_polled_count = processed;
             }
+            ipc_socket_unlock(state);
             return CD_STATUS_SCHEMA_MISMATCH;
         }
 
@@ -361,6 +389,7 @@ static cd_status_t ipc_socket_poll(
             if (out_polled_count != NULL) {
                 *out_polled_count = processed;
             }
+            ipc_socket_unlock(state);
             return CD_STATUS_TRANSPORT_UNAVAILABLE;
         }
 
@@ -374,12 +403,14 @@ static cd_status_t ipc_socket_poll(
         if (out_polled_count != NULL) {
             *out_polled_count = processed;
         }
+        ipc_socket_unlock(state);
         return CD_STATUS_TRANSPORT_UNAVAILABLE;
     }
 
     if (out_polled_count != NULL) {
         *out_polled_count = processed;
     }
+    ipc_socket_unlock(state);
     return CD_STATUS_OK;
 }
 
@@ -393,14 +424,18 @@ static cd_status_t ipc_socket_flush(void *impl)
         return CD_STATUS_INVALID_ARGUMENT;
     }
 
+    ipc_socket_lock(state);
     io_result = flush_pending_bytes(state);
     if (io_result == CD_IPC_IO_FAILED) {
+        ipc_socket_unlock(state);
         return CD_STATUS_TRANSPORT_UNAVAILABLE;
     }
     if (io_result == CD_IPC_IO_WOULD_BLOCK) {
+        ipc_socket_unlock(state);
         return CD_STATUS_CAPACITY_REACHED;
     }
 
+    ipc_socket_unlock(state);
     return CD_STATUS_OK;
 }
 
@@ -424,6 +459,9 @@ static void ipc_socket_shutdown(void *impl)
     }
     if (state->rx_buffer != NULL) {
         cd_context_free(context, state->rx_buffer);
+    }
+    if (state->lock != NULL) {
+        cd_mutex_destroy(context, state->lock);
     }
     cd_context_free(context, state);
 }
@@ -462,9 +500,14 @@ cd_status_t cd_ipc_socket_transport_init(
     state->codec_config.max_payload_size = max_payload_size;
     state->rx_capacity = frame_capacity;
     state->tx_capacity = frame_capacity;
+    if (cd_mutex_create(context, &state->lock) != CD_STATUS_OK) {
+        cd_context_free(context, state);
+        return CD_STATUS_ALLOCATION_FAILED;
+    }
 
     state->rx_buffer = (uint8_t *)cd_context_alloc(context, state->rx_capacity);
     if (state->rx_buffer == NULL) {
+        cd_mutex_destroy(context, state->lock);
         cd_context_free(context, state);
         return CD_STATUS_ALLOCATION_FAILED;
     }
@@ -473,6 +516,7 @@ cd_status_t cd_ipc_socket_transport_init(
     state->tx_buffer = (uint8_t *)cd_context_alloc(context, state->tx_capacity);
     if (state->tx_buffer == NULL) {
         cd_context_free(context, state->rx_buffer);
+        cd_mutex_destroy(context, state->lock);
         cd_context_free(context, state);
         return CD_STATUS_ALLOCATION_FAILED;
     }
@@ -483,6 +527,7 @@ cd_status_t cd_ipc_socket_transport_init(
         if (flags < 0 || fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
             cd_context_free(context, state->tx_buffer);
             cd_context_free(context, state->rx_buffer);
+            cd_mutex_destroy(context, state->lock);
             cd_context_free(context, state);
             return CD_STATUS_TRANSPORT_UNAVAILABLE;
         }
