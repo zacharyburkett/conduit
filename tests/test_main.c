@@ -68,6 +68,7 @@ typedef struct request_replier_state {
     char last_payload[32];
     const char *reply_payload;
     size_t reply_payload_size;
+    uint16_t reply_flags;
 } request_replier_state_t;
 
 static void test_free_adapter(void *user_data, void *ptr)
@@ -224,7 +225,7 @@ static cd_status_t request_replier_handler(void *user_data, const cd_envelope_t 
     reply_params.topic = message->topic;
     reply_params.schema_id = 9001u;
     reply_params.schema_version = 1u;
-    reply_params.flags = CD_MESSAGE_FLAG_LOCAL_ONLY;
+    reply_params.flags = state->reply_flags;
     reply_params.payload = state->reply_payload;
     reply_params.payload_size = state->reply_payload_size;
 
@@ -665,6 +666,7 @@ static int test_request_reply_roundtrip_and_dispose(void)
     replier_state.bus = runtime.bus;
     replier_state.reply_payload = "reply-ok";
     replier_state.reply_payload_size = strlen("reply-ok");
+    replier_state.reply_flags = CD_MESSAGE_FLAG_LOCAL_ONLY;
 
     memset(&sub, 0, sizeof(sub));
     sub.endpoint = 50u;
@@ -922,6 +924,246 @@ static int test_queue_and_argument_edges(void)
     return 0;
 }
 
+static int test_transport_attach_detach_validation(void)
+{
+    cd_context_t *context;
+    cd_bus_t *bus;
+    cd_bus_config_t bus_config;
+    cd_inproc_hub_t *hub;
+    cd_inproc_hub_config_t hub_config;
+    cd_transport_t transport_a;
+    cd_transport_t transport_b;
+    cd_transport_t invalid_transport;
+
+    context = NULL;
+    bus = NULL;
+    hub = NULL;
+    memset(&transport_a, 0, sizeof(transport_a));
+    memset(&transport_b, 0, sizeof(transport_b));
+    memset(&invalid_transport, 0, sizeof(invalid_transport));
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_transports = 1u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus), CD_STATUS_OK);
+
+    ASSERT_STATUS(cd_bus_attach_transport(NULL, &invalid_transport), CD_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(cd_bus_attach_transport(bus, NULL), CD_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(cd_bus_attach_transport(bus, &invalid_transport), CD_STATUS_INVALID_ARGUMENT);
+
+    memset(&hub_config, 0, sizeof(hub_config));
+    hub_config.max_peers = 2u;
+    hub_config.max_queued_messages_per_peer = 8u;
+    ASSERT_STATUS(cd_inproc_hub_init(context, &hub_config, &hub), CD_STATUS_OK);
+    ASSERT_STATUS(cd_inproc_hub_create_transport(hub, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_inproc_hub_create_transport(hub, &transport_b), CD_STATUS_OK);
+
+    ASSERT_STATUS(cd_bus_attach_transport(bus, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_attach_transport(bus, &transport_a), CD_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(cd_bus_attach_transport(bus, &transport_b), CD_STATUS_CAPACITY_REACHED);
+
+    ASSERT_STATUS(cd_bus_detach_transport(bus, &transport_b), CD_STATUS_NOT_FOUND);
+    ASSERT_STATUS(cd_bus_detach_transport(bus, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_detach_transport(bus, &transport_a), CD_STATUS_NOT_FOUND);
+    ASSERT_STATUS(cd_bus_detach_transport(NULL, &transport_a), CD_STATUS_INVALID_ARGUMENT);
+    ASSERT_STATUS(cd_bus_detach_transport(bus, NULL), CD_STATUS_INVALID_ARGUMENT);
+
+    cd_inproc_transport_close(&transport_a);
+    cd_inproc_transport_close(&transport_b);
+    cd_inproc_hub_shutdown(hub);
+    cd_bus_destroy(bus);
+    cd_context_shutdown(context);
+    return 0;
+}
+
+static int test_inproc_transport_event_routing_between_buses(void)
+{
+    cd_context_t *context;
+    cd_bus_t *bus_a;
+    cd_bus_t *bus_b;
+    cd_bus_config_t bus_config;
+    cd_inproc_hub_t *hub;
+    cd_inproc_hub_config_t hub_config;
+    cd_transport_t transport_a;
+    cd_transport_t transport_b;
+    cd_subscription_desc_t sub;
+    cd_publish_params_t publish;
+    capture_state_t capture;
+    handler_state_t handler;
+    size_t processed;
+
+    context = NULL;
+    bus_a = NULL;
+    bus_b = NULL;
+    hub = NULL;
+    memset(&transport_a, 0, sizeof(transport_a));
+    memset(&transport_b, 0, sizeof(transport_b));
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 32u;
+    bus_config.max_subscriptions = 16u;
+    bus_config.max_inflight_requests = 16u;
+    bus_config.max_transports = 2u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_b), CD_STATUS_OK);
+
+    memset(&hub_config, 0, sizeof(hub_config));
+    hub_config.max_peers = 2u;
+    hub_config.max_queued_messages_per_peer = 32u;
+    ASSERT_STATUS(cd_inproc_hub_init(context, &hub_config, &hub), CD_STATUS_OK);
+    ASSERT_STATUS(cd_inproc_hub_create_transport(hub, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_inproc_hub_create_transport(hub, &transport_b), CD_STATUS_OK);
+
+    ASSERT_STATUS(cd_bus_attach_transport(bus_a, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_attach_transport(bus_b, &transport_b), CD_STATUS_OK);
+
+    memset(&capture, 0, sizeof(capture));
+    memset(&handler, 0, sizeof(handler));
+    handler.capture = &capture;
+    handler.marker = 44;
+    handler.return_status = CD_STATUS_OK;
+
+    memset(&sub, 0, sizeof(sub));
+    sub.endpoint = 9u;
+    sub.topic = 700u;
+    sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_EVENT);
+    sub.handler = generic_handler;
+    sub.user_data = &handler;
+    ASSERT_STATUS(cd_subscribe(bus_b, &sub, NULL), CD_STATUS_OK);
+
+    memset(&publish, 0, sizeof(publish));
+    publish.source_endpoint = 3u;
+    publish.topic = 700u;
+    publish.schema_id = 11u;
+    publish.schema_version = 1u;
+    publish.flags = 0u;
+    publish.payload = "xy";
+    publish.payload_size = 2u;
+    ASSERT_STATUS(cd_publish(bus_a, &publish, NULL), CD_STATUS_OK);
+
+    processed = 0u;
+    ASSERT_STATUS(cd_bus_pump(bus_b, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(processed == 1u);
+    ASSERT_TRUE(capture.count == 1);
+    ASSERT_TRUE(capture.markers[0] == 44);
+    ASSERT_TRUE(capture.kinds[0] == CD_MESSAGE_EVENT);
+    ASSERT_TRUE(strcmp(capture.payloads[0], "xy") == 0);
+
+    ASSERT_STATUS(cd_bus_pump(bus_a, 0u, &processed), CD_STATUS_OK);
+
+    cd_inproc_transport_close(&transport_a);
+    cd_inproc_transport_close(&transport_b);
+    cd_inproc_hub_shutdown(hub);
+    cd_bus_destroy(bus_a);
+    cd_bus_destroy(bus_b);
+    cd_context_shutdown(context);
+    return 0;
+}
+
+static int test_inproc_transport_request_reply_between_buses(void)
+{
+    cd_context_t *context;
+    cd_bus_t *bus_a;
+    cd_bus_t *bus_b;
+    cd_bus_config_t bus_config;
+    cd_inproc_hub_t *hub;
+    cd_inproc_hub_config_t hub_config;
+    cd_transport_t transport_a;
+    cd_transport_t transport_b;
+    cd_subscription_desc_t sub;
+    request_replier_state_t replier_state;
+    cd_request_params_t request;
+    cd_request_token_t token;
+    size_t processed;
+    int ready;
+    cd_reply_t reply;
+
+    context = NULL;
+    bus_a = NULL;
+    bus_b = NULL;
+    hub = NULL;
+    memset(&transport_a, 0, sizeof(transport_a));
+    memset(&transport_b, 0, sizeof(transport_b));
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 32u;
+    bus_config.max_subscriptions = 16u;
+    bus_config.max_inflight_requests = 16u;
+    bus_config.max_transports = 2u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_b), CD_STATUS_OK);
+
+    memset(&hub_config, 0, sizeof(hub_config));
+    hub_config.max_peers = 2u;
+    hub_config.max_queued_messages_per_peer = 32u;
+    ASSERT_STATUS(cd_inproc_hub_init(context, &hub_config, &hub), CD_STATUS_OK);
+    ASSERT_STATUS(cd_inproc_hub_create_transport(hub, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_inproc_hub_create_transport(hub, &transport_b), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_attach_transport(bus_a, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_attach_transport(bus_b, &transport_b), CD_STATUS_OK);
+
+    memset(&replier_state, 0, sizeof(replier_state));
+    replier_state.bus = bus_b;
+    replier_state.reply_payload = "remote-ok";
+    replier_state.reply_payload_size = strlen("remote-ok");
+    replier_state.reply_flags = 0u;
+
+    memset(&sub, 0, sizeof(sub));
+    sub.endpoint = 55u;
+    sub.topic = 808u;
+    sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_REQUEST);
+    sub.handler = request_replier_handler;
+    sub.user_data = &replier_state;
+    ASSERT_STATUS(cd_subscribe(bus_b, &sub, NULL), CD_STATUS_OK);
+
+    memset(&request, 0, sizeof(request));
+    request.source_endpoint = 6u;
+    request.target_endpoint = 55u;
+    request.topic = 808u;
+    request.schema_id = 77u;
+    request.schema_version = 1u;
+    request.flags = 0u;
+    request.timeout_ns = 1000000000ull;
+    request.payload = "remote-ask";
+    request.payload_size = strlen("remote-ask");
+
+    token = 0u;
+    ASSERT_STATUS(cd_request_async(bus_a, &request, &token), CD_STATUS_OK);
+    ASSERT_TRUE(token != 0u);
+
+    processed = 0u;
+    ASSERT_STATUS(cd_bus_pump(bus_b, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(processed == 1u);
+    ASSERT_TRUE(replier_state.request_hits == 1);
+    ASSERT_TRUE(strcmp(replier_state.last_payload, "remote-ask") == 0);
+
+    processed = 0u;
+    ASSERT_STATUS(cd_bus_pump(bus_a, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(processed == 2u);
+
+    ready = 0;
+    memset(&reply, 0, sizeof(reply));
+    ASSERT_STATUS(cd_poll_reply(bus_a, token, &reply, &ready), CD_STATUS_OK);
+    ASSERT_TRUE(ready == 1);
+    ASSERT_TRUE(reply.payload != NULL);
+    ASSERT_TRUE(reply.payload_size == replier_state.reply_payload_size);
+    ASSERT_TRUE(strncmp((const char *)reply.payload, "remote-ok", reply.payload_size) == 0);
+    cd_reply_dispose(bus_a, &reply);
+
+    cd_inproc_transport_close(&transport_a);
+    cd_inproc_transport_close(&transport_b);
+    cd_inproc_hub_shutdown(hub);
+    cd_bus_destroy(bus_a);
+    cd_bus_destroy(bus_b);
+    cd_context_shutdown(context);
+    return 0;
+}
+
 static int test_context_validation_edges(void)
 {
     cd_context_t *context;
@@ -962,6 +1204,9 @@ int main(void)
     RUN_TEST(test_request_reply_roundtrip_and_dispose);
     RUN_TEST(test_request_timeout_with_fake_clock);
     RUN_TEST(test_request_inflight_capacity_and_validation);
+    RUN_TEST(test_transport_attach_detach_validation);
+    RUN_TEST(test_inproc_transport_event_routing_between_buses);
+    RUN_TEST(test_inproc_transport_request_reply_between_buses);
     RUN_TEST(test_queue_and_argument_edges);
 
     return 0;

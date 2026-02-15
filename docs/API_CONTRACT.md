@@ -26,6 +26,8 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - Requests are directed messages routed to the target endpoint.
 - Replies are correlated through `correlation_id` (request `message_id`) and
   stored in the requester's inflight mailbox.
+- Non-`LOCAL_ONLY` messages are forwarded to attached transports.
+- Incoming transport messages are enqueued locally and processed by `cd_bus_pump`.
 
 ## Status and Error Behavior
 
@@ -48,6 +50,13 @@ This document freezes the initial API behavior and ownership rules for the scaff
   - `CD_STATUS_NOT_FOUND`: token does not exist/already consumed
 - Reply payload returned by `cd_poll_reply` must be released with
   `cd_reply_dispose`.
+
+## Transport Semantics
+
+- `cd_bus_attach_transport` stores non-owning transport references.
+- `cd_bus_pump` polls attached transports before processing the local queue snapshot.
+- Replies from transport are captured through normal inflight correlation.
+- Timed-out requests are dropped if later encountered in the dispatch queue.
 
 ## Phase Boundaries
 

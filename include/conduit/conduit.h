@@ -3,6 +3,8 @@
 
 #include "conduit/bus.h"
 #include "conduit/context.h"
+#include "conduit/transport.h"
+#include "conduit/transport_inproc.h"
 #include "conduit/types.h"
 
 #ifdef __cplusplus

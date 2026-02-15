@@ -2,6 +2,7 @@
 #define CONDUIT_BUS_H
 
 #include "conduit/context.h"
+#include "conduit/transport.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,6 +17,8 @@ typedef struct cd_bus_config {
     size_t max_subscriptions;
     /* 0 uses implementation default. */
     size_t max_inflight_requests;
+    /* 0 uses implementation default. */
+    size_t max_transports;
 } cd_bus_config_t;
 
 typedef cd_status_t (*cd_message_handler_fn)(void *user_data, const cd_envelope_t *message);
@@ -87,6 +90,15 @@ typedef struct cd_reply {
 
 cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, cd_bus_t **out_bus);
 void cd_bus_destroy(cd_bus_t *bus);
+
+/*
+ * Attach/detach transport endpoints to a bus.
+ *
+ * Transports are non-owning references; caller controls transport lifetime.
+ * Attach rejects duplicates and enforces max_transports capacity.
+ */
+cd_status_t cd_bus_attach_transport(cd_bus_t *bus, cd_transport_t *transport);
+cd_status_t cd_bus_detach_transport(cd_bus_t *bus, cd_transport_t *transport);
 
 /*
  * Drain queued messages from a stable queue snapshot taken at pump start.

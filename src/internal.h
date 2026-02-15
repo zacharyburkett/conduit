@@ -16,6 +16,7 @@ struct cd_context {
 typedef struct cd_queued_message {
     cd_envelope_t envelope;
     void *payload_copy;
+    bool tracked_request;
 } cd_queued_message_t;
 
 typedef struct cd_subscription_entry {
@@ -60,6 +61,8 @@ struct cd_bus {
     cd_dispatch_target_t *dispatch_targets;
     cd_inflight_request_t *inflight_requests;
     size_t inflight_request_capacity;
+    cd_transport_t **transports;
+    size_t transport_capacity;
     cd_subscription_id_t next_subscription_id;
     cd_message_id_t next_message_id;
     cd_request_token_t next_request_token;

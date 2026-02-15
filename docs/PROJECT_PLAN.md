@@ -79,6 +79,14 @@ Acceptance criteria:
 - Protocol mismatch paths return explicit errors.
 - Payload size limits enforced.
 
+Status:
+- Started with transport abstraction + in-process transport adapter:
+  - `include/conduit/transport.h`
+  - `include/conduit/transport_inproc.h`
+  - `src/transport_inproc.c`
+- Bus transport integration and cross-bus tests are in place as groundwork for
+  IPC framing work.
+
 ## Phase 5: Broker/Bridge App
 
 Deliverables:

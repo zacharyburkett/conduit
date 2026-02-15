@@ -40,6 +40,12 @@ This sample demonstrates deterministic embedded dispatch with the flow:
 - `map.generated`
 - `entity.spawn.request` (request/reply)
 
+## Transport Layer (Phase 4 Start)
+
+- Generic transport contract: `include/conduit/transport.h`
+- In-process hub transport: `include/conduit/transport_inproc.h`
+- Bus supports transport attach/detach + polling in `cd_bus_pump`.
+
 ## Direction Summary
 
 - Build an in-process bus first (deterministic, low overhead, simple API).
