@@ -36,6 +36,8 @@ typedef struct loadgen_config {
     size_t payload_size;
     uint64_t request_timeout_ns;
     uint64_t max_duration_ms;
+    size_t max_queued_messages;
+    size_t max_inflight_requests;
     int connect_attempts;
     useconds_t connect_retry_sleep_us;
 } loadgen_config_t;
@@ -54,6 +56,16 @@ static uint64_t now_ms(void)
         return 0u;
     }
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000u);
+}
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0u;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 static bool parse_u64_arg(const char *text, uint64_t *out_value)
@@ -86,6 +98,8 @@ static void print_usage(const char *program_name)
         "  --payload-size <bytes>    default 64 (min 8)\n"
         "  --request-timeout-ns <n>  default 1000000000\n"
         "  --max-duration-ms <n>     default 15000\n"
+        "  --max-queued-messages <n> default 4096\n"
+        "  --max-inflight-requests <n> default 256\n"
         "  --connect-attempts <n>    default 3000\n"
         "  --help\n",
         program_name
@@ -107,6 +121,8 @@ static bool parse_args(int argc, char **argv, loadgen_config_t *out_config)
     config.payload_size = 64u;
     config.request_timeout_ns = 1000000000ull;
     config.max_duration_ms = 15000u;
+    config.max_queued_messages = 4096u;
+    config.max_inflight_requests = 256u;
     config.connect_attempts = 3000;
     config.connect_retry_sleep_us = 1000u;
 
@@ -153,6 +169,16 @@ static bool parse_args(int argc, char **argv, loadgen_config_t *out_config)
                 return false;
             }
             config.max_duration_ms = value;
+        } else if (strcmp(arg, "--max-queued-messages") == 0) {
+            if (!parse_u64_arg(argv[i + 1], &value) || value == 0u || value > SIZE_MAX) {
+                return false;
+            }
+            config.max_queued_messages = (size_t)value;
+        } else if (strcmp(arg, "--max-inflight-requests") == 0) {
+            if (!parse_u64_arg(argv[i + 1], &value) || value == 0u || value > SIZE_MAX) {
+                return false;
+            }
+            config.max_inflight_requests = (size_t)value;
         } else if (strcmp(arg, "--connect-attempts") == 0) {
             if (!parse_u64_arg(argv[i + 1], &value) || value == 0u || value > (uint64_t)INT32_MAX) {
                 return false;
@@ -312,6 +338,14 @@ int main(int argc, char **argv)
     uint64_t replies_received;
     uint64_t start_ms;
     uint64_t deadline_ms;
+    uint64_t event_phase_start_ms;
+    uint64_t request_phase_start_ms;
+    uint64_t event_phase_elapsed_ms;
+    uint64_t request_phase_elapsed_ms;
+    uint64_t event_queue_full_retries;
+    uint64_t request_queue_full_retries;
+    uint64_t request_rtt_total_ns;
+    uint64_t request_rtt_max_ns;
     int sender_fd;
     int replier_fd;
 
@@ -353,9 +387,9 @@ int main(int argc, char **argv)
     }
 
     memset(&bus_config, 0, sizeof(bus_config));
-    bus_config.max_queued_messages = 4096u;
+    bus_config.max_queued_messages = config.max_queued_messages;
     bus_config.max_subscriptions = 32u;
-    bus_config.max_inflight_requests = 256u;
+    bus_config.max_inflight_requests = config.max_inflight_requests;
     bus_config.max_transports = 1u;
     if (cd_bus_create(context, &bus_config, &bus_sender) != CD_STATUS_OK ||
         cd_bus_create(context, &bus_config, &bus_replier) != CD_STATUS_OK) {
@@ -471,6 +505,14 @@ int main(int argc, char **argv)
 
     start_ms = now_ms();
     deadline_ms = start_ms + config.max_duration_ms;
+    event_phase_start_ms = start_ms;
+    event_phase_elapsed_ms = 0u;
+    request_phase_start_ms = 0u;
+    request_phase_elapsed_ms = 0u;
+    event_queue_full_retries = 0u;
+    request_queue_full_retries = 0u;
+    request_rtt_total_ns = 0u;
+    request_rtt_max_ns = 0u;
     events_sent = 0u;
     requests_sent = 0u;
     replies_received = 0u;
@@ -510,7 +552,9 @@ int main(int argc, char **argv)
             if (status == CD_STATUS_OK) {
                 events_sent += 1u;
                 progressed = true;
-            } else if (status != CD_STATUS_QUEUE_FULL) {
+            } else if (status == CD_STATUS_QUEUE_FULL) {
+                event_queue_full_retries += 1u;
+            } else {
                 fprintf(stderr, "[loadgen] event publish failed: %s\n", cd_status_string(status));
                 free(payload_buffer);
                 cd_ipc_socket_transport_close(&transport_sender);
@@ -540,11 +584,14 @@ int main(int argc, char **argv)
             usleep(200u);
         }
     }
+    event_phase_elapsed_ms = now_ms() - event_phase_start_ms;
+    request_phase_start_ms = now_ms();
 
     while (requests_sent < config.requests) {
         cd_request_params_t request;
         cd_request_token_t token;
         uint64_t value;
+        uint64_t request_send_ns;
         cd_status_t status;
 
         if (now_ms() >= deadline_ms) {
@@ -573,9 +620,11 @@ int main(int argc, char **argv)
         request.payload_size = config.payload_size;
 
         token = 0u;
+        request_send_ns = now_ns();
         status = cd_request_async(bus_sender, &request, &token);
         if (status == CD_STATUS_QUEUE_FULL) {
             size_t processed_total;
+            request_queue_full_retries += 1u;
             status = pump_pair(bus_sender, bus_replier, &processed_total);
             if (status != CD_STATUS_OK) {
                 fprintf(stderr, "[loadgen] pump failed before request send: %s\n", cd_status_string(status));
@@ -658,6 +707,14 @@ int main(int argc, char **argv)
                     cd_context_shutdown(context);
                     return 1;
                 }
+                {
+                    uint64_t request_rtt_ns;
+                    request_rtt_ns = now_ns() - request_send_ns;
+                    request_rtt_total_ns += request_rtt_ns;
+                    if (request_rtt_ns > request_rtt_max_ns) {
+                        request_rtt_max_ns = request_rtt_ns;
+                    }
+                }
                 replies_received += 1u;
                 break;
             }
@@ -678,11 +735,14 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+    request_phase_elapsed_ms = now_ms() - request_phase_start_ms;
 
     {
         uint64_t elapsed_ms;
         uint64_t total_messages;
         double throughput;
+        double request_rtt_avg_us;
+        double request_rtt_max_us;
 
         elapsed_ms = now_ms() - start_ms;
         if (elapsed_ms == 0u) {
@@ -690,11 +750,18 @@ int main(int argc, char **argv)
         }
         total_messages = events_sent + requests_sent + replies_received;
         throughput = ((double)total_messages * 1000.0) / (double)elapsed_ms;
+        request_rtt_avg_us =
+            requests_sent > 0u ? ((double)request_rtt_total_ns / (double)requests_sent) / 1000.0 : 0.0;
+        request_rtt_max_us = ((double)request_rtt_max_ns) / 1000.0;
 
         printf(
             "[loadgen] done events_sent=%" PRIu64 " events_received=%" PRIu64
             " requests_sent=%" PRIu64 " replies_received=%" PRIu64
             " request_hits=%" PRIu64 " elapsed_ms=%" PRIu64
+            " event_phase_ms=%" PRIu64 " request_phase_ms=%" PRIu64
+            " req_rtt_avg_us=%.2f req_rtt_max_us=%.2f"
+            " event_queue_full_retries=%" PRIu64
+            " request_queue_full_retries=%" PRIu64
             " throughput_msg_per_s=%.2f\n",
             events_sent,
             state.events_received,
@@ -702,6 +769,12 @@ int main(int argc, char **argv)
             replies_received,
             state.request_hits,
             elapsed_ms,
+            event_phase_elapsed_ms,
+            request_phase_elapsed_ms,
+            request_rtt_avg_us,
+            request_rtt_max_us,
+            event_queue_full_retries,
+            request_queue_full_retries,
             throughput
         );
     }

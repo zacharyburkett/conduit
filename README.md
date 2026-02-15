@@ -102,7 +102,19 @@ Optional flags:
 - `--payload-size <bytes>`
 - `--request-timeout-ns <n>`
 - `--max-duration-ms <n>`
+- `--max-queued-messages <n>`
+- `--max-inflight-requests <n>`
 - `--connect-attempts <n>`
+
+Loadgen summary now includes:
+- overall throughput (`throughput_msg_per_s`)
+- event/request phase durations (`event_phase_ms`, `request_phase_ms`)
+- request roundtrip latency stats (`req_rtt_avg_us`, `req_rtt_max_us`)
+- queue pressure counters (`event_queue_full_retries`, `request_queue_full_retries`)
+
+Integration coverage includes a profiling baseline test with conservative
+thresholds (`test_loadgen_profile_baseline_against_broker`) in addition to soak
+and reliability stress scenarios.
 
 Reliability tests now include malformed-frame burst and disconnect-storm
 scenarios under active load.

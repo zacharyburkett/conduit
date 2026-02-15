@@ -149,6 +149,14 @@ Status:
   - reserved broker request/reply endpoint (`0xFFFFFFFE`)
   - metrics snapshot text payload reply (`clients/published/delivered/dropped/timeouts/transport_errors`)
   - integration test `tests/test_main.c` (`test_broker_diagnostics_request_endpoint`)
+- Profiling/queue-tuning baseline started:
+  - loadgen now emits phase timing, request RTT, and queue-pressure counters
+  - loadgen now supports queue/inflight tuning flags
+  - integration test `tests/test_main.c` (`test_loadgen_profile_baseline_against_broker`)
+  - current conservative baseline gates:
+    - throughput >= 200 msg/s
+    - request avg RTT <= 50 ms
+    - request max RTT <= 500 ms
 
 ## Test Matrix
 

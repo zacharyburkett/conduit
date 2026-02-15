@@ -100,6 +100,22 @@ typedef struct broker_metrics_snapshot {
     uint64_t transport_errors;
 } broker_metrics_snapshot_t;
 
+typedef struct loadgen_summary {
+    uint64_t events_sent;
+    uint64_t events_received;
+    uint64_t requests_sent;
+    uint64_t replies_received;
+    uint64_t request_hits;
+    uint64_t elapsed_ms;
+    uint64_t event_phase_ms;
+    uint64_t request_phase_ms;
+    uint64_t event_queue_full_retries;
+    uint64_t request_queue_full_retries;
+    double req_rtt_avg_us;
+    double req_rtt_max_us;
+    double throughput_msg_per_s;
+} loadgen_summary_t;
+
 static void close_fd_if_open(int *fd)
 {
     if (fd != NULL && *fd >= 0) {
@@ -287,6 +303,8 @@ static pid_t spawn_loadgen_process(
     const char *payload_size,
     const char *max_duration_ms,
     const char *request_timeout_ns,
+    const char *max_queued_messages,
+    const char *max_inflight_requests,
     const char *log_path
 )
 {
@@ -317,23 +335,35 @@ static pid_t spawn_loadgen_process(
             close(log_fd);
         }
 
-        execl(
-            CONDUIT_LOADGEN_BIN,
-            CONDUIT_LOADGEN_BIN,
-            "--socket",
-            socket_path,
-            "--events",
-            events,
-            "--requests",
-            requests,
-            "--payload-size",
-            payload_size,
-            "--max-duration-ms",
-            max_duration_ms,
-            "--request-timeout-ns",
-            request_timeout_ns,
-            (char *)NULL
-        );
+        {
+            const char *argv_buffer[24];
+            int argc;
+
+            argc = 0;
+            argv_buffer[argc++] = CONDUIT_LOADGEN_BIN;
+            argv_buffer[argc++] = "--socket";
+            argv_buffer[argc++] = socket_path;
+            argv_buffer[argc++] = "--events";
+            argv_buffer[argc++] = events;
+            argv_buffer[argc++] = "--requests";
+            argv_buffer[argc++] = requests;
+            argv_buffer[argc++] = "--payload-size";
+            argv_buffer[argc++] = payload_size;
+            argv_buffer[argc++] = "--max-duration-ms";
+            argv_buffer[argc++] = max_duration_ms;
+            argv_buffer[argc++] = "--request-timeout-ns";
+            argv_buffer[argc++] = request_timeout_ns;
+            if (max_queued_messages != NULL && max_queued_messages[0] != '\0') {
+                argv_buffer[argc++] = "--max-queued-messages";
+                argv_buffer[argc++] = max_queued_messages;
+            }
+            if (max_inflight_requests != NULL && max_inflight_requests[0] != '\0') {
+                argv_buffer[argc++] = "--max-inflight-requests";
+                argv_buffer[argc++] = max_inflight_requests;
+            }
+            argv_buffer[argc++] = NULL;
+            execv(CONDUIT_LOADGEN_BIN, (char *const *)argv_buffer);
+        }
         _exit(127);
     }
 
@@ -412,6 +442,118 @@ static int parse_broker_final_metrics(
             out_metrics->transport_errors = (uint64_t)transport_errors;
             found = 1;
         }
+    }
+
+    fclose(file);
+    return found ? 0 : 1;
+}
+
+static int parse_line_u64_field(const char *line, const char *field_prefix, uint64_t *out_value)
+{
+    const char *start;
+    unsigned long long value;
+    char *end_ptr;
+
+    if (line == NULL || field_prefix == NULL || out_value == NULL) {
+        return 1;
+    }
+
+    start = strstr(line, field_prefix);
+    if (start == NULL) {
+        return 1;
+    }
+    start += strlen(field_prefix);
+
+    errno = 0;
+    end_ptr = NULL;
+    value = strtoull(start, &end_ptr, 10);
+    if (errno != 0 || end_ptr == start) {
+        return 1;
+    }
+
+    *out_value = (uint64_t)value;
+    return 0;
+}
+
+static int parse_line_double_field(const char *line, const char *field_prefix, double *out_value)
+{
+    const char *start;
+    char *end_ptr;
+    double value;
+
+    if (line == NULL || field_prefix == NULL || out_value == NULL) {
+        return 1;
+    }
+
+    start = strstr(line, field_prefix);
+    if (start == NULL) {
+        return 1;
+    }
+    start += strlen(field_prefix);
+
+    errno = 0;
+    end_ptr = NULL;
+    value = strtod(start, &end_ptr);
+    if (errno != 0 || end_ptr == start) {
+        return 1;
+    }
+
+    *out_value = value;
+    return 0;
+}
+
+static int parse_loadgen_done_summary(const char *log_path, loadgen_summary_t *out_summary)
+{
+    FILE *file;
+    char line[1024];
+    int found;
+
+    if (log_path == NULL || out_summary == NULL) {
+        return 1;
+    }
+
+    memset(out_summary, 0, sizeof(*out_summary));
+    file = fopen(log_path, "r");
+    if (file == NULL) {
+        return 1;
+    }
+
+    found = 0;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (strncmp(line, "[loadgen] done ", strlen("[loadgen] done ")) != 0) {
+            continue;
+        }
+
+        if (parse_line_u64_field(line, "events_sent=", &out_summary->events_sent) != 0 ||
+            parse_line_u64_field(line, "events_received=", &out_summary->events_received) != 0 ||
+            parse_line_u64_field(line, "requests_sent=", &out_summary->requests_sent) != 0 ||
+            parse_line_u64_field(line, "replies_received=", &out_summary->replies_received) != 0 ||
+            parse_line_u64_field(line, "request_hits=", &out_summary->request_hits) != 0 ||
+            parse_line_u64_field(line, "elapsed_ms=", &out_summary->elapsed_ms) != 0 ||
+            parse_line_u64_field(line, "event_phase_ms=", &out_summary->event_phase_ms) != 0 ||
+            parse_line_u64_field(line, "request_phase_ms=", &out_summary->request_phase_ms) != 0 ||
+            parse_line_u64_field(
+                line,
+                "event_queue_full_retries=",
+                &out_summary->event_queue_full_retries
+            ) != 0 ||
+            parse_line_u64_field(
+                line,
+                "request_queue_full_retries=",
+                &out_summary->request_queue_full_retries
+            ) != 0 ||
+            parse_line_double_field(line, "req_rtt_avg_us=", &out_summary->req_rtt_avg_us) != 0 ||
+            parse_line_double_field(line, "req_rtt_max_us=", &out_summary->req_rtt_max_us) != 0 ||
+            parse_line_double_field(
+                line,
+                "throughput_msg_per_s=",
+                &out_summary->throughput_msg_per_s
+            ) != 0) {
+            fclose(file);
+            return 1;
+        }
+
+        found = 1;
     }
 
     fclose(file);
@@ -3098,6 +3240,8 @@ static int test_loadgen_soak_against_broker(void)
         "64",
         "15000",
         "2000000000",
+        "4096",
+        "256",
         loadgen_log_path
     );
     ASSERT_TRUE(loadgen_pid > 0);
@@ -3111,6 +3255,106 @@ static int test_loadgen_soak_against_broker(void)
     ASSERT_TRUE(parse_broker_final_metrics(broker_log_path, &broker_metrics) == 0);
     ASSERT_TRUE(broker_metrics.published >= 4200u);
     ASSERT_TRUE(broker_metrics.delivered >= 3600u);
+    ASSERT_TRUE(broker_metrics.timeouts == 0u);
+
+    unlink(socket_path);
+    unlink(broker_log_path);
+    unlink(loadgen_log_path);
+    return 0;
+}
+
+static int test_loadgen_profile_baseline_against_broker(void)
+{
+    pid_t broker_pid;
+    pid_t loadgen_pid;
+    int broker_status;
+    int loadgen_status;
+    char socket_path[104];
+    char broker_log_path[128];
+    char loadgen_log_path[128];
+    broker_metrics_snapshot_t broker_metrics;
+    loadgen_summary_t summary;
+
+    broker_pid = -1;
+    loadgen_pid = -1;
+    broker_status = 0;
+    loadgen_status = 0;
+    memset(&broker_metrics, 0, sizeof(broker_metrics));
+    memset(&summary, 0, sizeof(summary));
+
+    if (!unix_path_socket_bind_supported()) {
+        return 0;
+    }
+
+    snprintf(
+        socket_path,
+        sizeof(socket_path),
+        "/tmp/conduit-loadgen-profile-%ld-%u.sock",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    snprintf(
+        broker_log_path,
+        sizeof(broker_log_path),
+        "/tmp/conduit-loadgen-profile-broker-%ld-%u.log",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    snprintf(
+        loadgen_log_path,
+        sizeof(loadgen_log_path),
+        "/tmp/conduit-loadgen-profile-client-%ld-%u.log",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+
+    unlink(socket_path);
+    unlink(broker_log_path);
+    unlink(loadgen_log_path);
+
+    broker_pid = spawn_broker_process(socket_path, NULL, "25000", "0", broker_log_path);
+    ASSERT_TRUE(broker_pid > 0);
+
+    loadgen_pid = spawn_loadgen_process(
+        socket_path,
+        "4000",
+        "800",
+        "64",
+        "20000",
+        "2000000000",
+        "4096",
+        "512",
+        loadgen_log_path
+    );
+    ASSERT_TRUE(loadgen_pid > 0);
+    ASSERT_TRUE(waitpid(loadgen_pid, &loadgen_status, 0) == loadgen_pid);
+    ASSERT_TRUE(WIFEXITED(loadgen_status));
+    ASSERT_TRUE(WEXITSTATUS(loadgen_status) == 0);
+    ASSERT_TRUE(parse_loadgen_done_summary(loadgen_log_path, &summary) == 0);
+
+    ASSERT_TRUE(summary.events_sent == 4000u);
+    ASSERT_TRUE(summary.events_received == 4000u);
+    ASSERT_TRUE(summary.requests_sent == 800u);
+    ASSERT_TRUE(summary.replies_received == 800u);
+    ASSERT_TRUE(summary.request_hits == 800u);
+    ASSERT_TRUE(summary.elapsed_ms > 0u);
+    ASSERT_TRUE(summary.event_phase_ms > 0u);
+    ASSERT_TRUE(summary.request_phase_ms > 0u);
+    ASSERT_TRUE(summary.req_rtt_avg_us > 0.0);
+    ASSERT_TRUE(summary.req_rtt_max_us > 0.0);
+
+    ASSERT_TRUE(summary.throughput_msg_per_s >= 200.0);
+    ASSERT_TRUE(summary.req_rtt_avg_us <= 50000.0);
+    ASSERT_TRUE(summary.req_rtt_max_us <= 500000.0);
+    ASSERT_TRUE(summary.event_queue_full_retries <= 512u);
+    ASSERT_TRUE(summary.request_queue_full_retries <= 512u);
+
+    ASSERT_TRUE(stop_broker_process(broker_pid, &broker_status) == 0);
+    ASSERT_TRUE(WIFEXITED(broker_status));
+    ASSERT_TRUE(WEXITSTATUS(broker_status) == 0);
+    ASSERT_TRUE(parse_broker_final_metrics(broker_log_path, &broker_metrics) == 0);
+    ASSERT_TRUE(broker_metrics.published >= 5600u);
+    ASSERT_TRUE(broker_metrics.delivered >= 4800u);
     ASSERT_TRUE(broker_metrics.timeouts == 0u);
 
     unlink(socket_path);
@@ -3176,6 +3420,8 @@ static int test_broker_malformed_frame_burst_under_load(void)
         "64",
         "15000",
         "2000000000",
+        "4096",
+        "256",
         loadgen_log_path
     );
     ASSERT_TRUE(loadgen_pid > 0);
@@ -3270,6 +3516,8 @@ static int test_broker_disconnect_storm_under_load(void)
         "64",
         "15000",
         "2000000000",
+        "4096",
+        "256",
         loadgen_log_path
     );
     ASSERT_TRUE(loadgen_pid > 0);
@@ -3354,6 +3602,7 @@ int main(void)
     RUN_TEST(test_broker_diagnostics_request_endpoint);
     RUN_TEST(test_broker_restart_with_client_reconnect);
     RUN_TEST(test_loadgen_soak_against_broker);
+    RUN_TEST(test_loadgen_profile_baseline_against_broker);
     RUN_TEST(test_broker_malformed_frame_burst_under_load);
     RUN_TEST(test_broker_disconnect_storm_under_load);
     RUN_TEST(test_ipc_codec_roundtrip);

@@ -102,8 +102,18 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - `apps/loadgen/main.c` drives high-volume event and request/reply traffic
   through the broker.
 - Loadgen validates message counts and reply correlation under bounded runtime.
+- Loadgen supports queue/inflight tuning flags:
+  - `--max-queued-messages`
+  - `--max-inflight-requests`
+- Loadgen summary output includes:
+  - throughput (`throughput_msg_per_s`)
+  - phase timing (`event_phase_ms`, `request_phase_ms`)
+  - request RTT stats (`req_rtt_avg_us`, `req_rtt_max_us`)
+  - queue pressure counters (`event_queue_full_retries`, `request_queue_full_retries`)
 - Integration test `test_loadgen_soak_against_broker` validates broker behavior
   under synthetic load.
+- Integration test `test_loadgen_profile_baseline_against_broker` validates a
+  conservative throughput/latency baseline and queue pressure bounds.
 - Additional stress tests validate broker resilience under malformed-frame
   bursts and client disconnect storms while load traffic is active.
 
