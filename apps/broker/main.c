@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -33,6 +34,7 @@ typedef struct broker_config {
     size_t max_endpoint_routes;
     uint64_t metrics_interval_ms;
     uint64_t run_ms;
+    bool trace_enabled;
 } broker_config_t;
 
 typedef struct broker_client {
@@ -72,6 +74,7 @@ typedef struct broker_state {
     broker_endpoint_route_t *endpoint_routes;
     size_t endpoint_route_capacity;
     bool explicit_topic_routes_only;
+    bool trace_enabled;
     broker_metrics_t metrics;
     cd_message_id_t next_generated_message_id;
 } broker_state_t;
@@ -84,6 +87,37 @@ typedef struct broker_receive_context {
 static volatile sig_atomic_t g_broker_running = 1;
 
 static size_t active_client_count(const broker_state_t *state);
+
+static const char *broker_message_kind_string(cd_message_kind_t kind)
+{
+    switch (kind) {
+    case CD_MESSAGE_EVENT:
+        return "event";
+    case CD_MESSAGE_COMMAND:
+        return "command";
+    case CD_MESSAGE_REQUEST:
+        return "request";
+    case CD_MESSAGE_REPLY:
+        return "reply";
+    default:
+        return "unknown";
+    }
+}
+
+static void broker_tracef(const broker_state_t *state, const char *fmt, ...)
+{
+    va_list args;
+
+    if (state == NULL || !state->trace_enabled || fmt == NULL) {
+        return;
+    }
+
+    fprintf(stdout, "[broker-trace] ");
+    va_start(args, fmt);
+    vfprintf(stdout, fmt, args);
+    va_end(args);
+    fputc('\n', stdout);
+}
 
 static void broker_signal_handler(int signum)
 {
@@ -163,6 +197,7 @@ static void print_usage(const char *program_name)
         "  --metrics-interval-ms <n>  default %u (0 disables periodic print)\n"
         "  --routes-file <path>       explicit topic route config\n"
         "  --run-ms <n>               stop after n milliseconds (0 = run until signal)\n"
+        "  --trace                    emit broker routing trace lines\n"
         "  --help\n",
         program_name,
         (unsigned)CD_BROKER_DEFAULT_MAX_CLIENTS,
@@ -187,6 +222,7 @@ static bool parse_args(int argc, char **argv, broker_config_t *out_config)
     config.max_endpoint_routes = CD_BROKER_DEFAULT_MAX_ENDPOINT_ROUTES;
     config.metrics_interval_ms = CD_BROKER_DEFAULT_METRICS_INTERVAL_MS;
     config.run_ms = 0u;
+    config.trace_enabled = false;
 
     i = 1;
     while (i < argc) {
@@ -197,6 +233,11 @@ static bool parse_args(int argc, char **argv, broker_config_t *out_config)
         if (strcmp(arg, "--help") == 0) {
             print_usage(argv[0]);
             return false;
+        }
+        if (strcmp(arg, "--trace") == 0) {
+            config.trace_enabled = true;
+            i += 1;
+            continue;
         }
         if (i + 1 >= argc) {
             fprintf(stderr, "Missing value for option: %s\n", arg);
@@ -721,7 +762,20 @@ static void route_incoming_message(
 
     state->metrics.published += 1u;
     upsert_endpoint_route(state, message->source_endpoint, source_client_index);
+    broker_tracef(
+        state,
+        "recv client=%zu kind=%s msg=%" PRIu64 " corr=%" PRIu64
+        " topic=0x%08x src=%u dst=%u",
+        source_client_index,
+        broker_message_kind_string(message->kind),
+        message->message_id,
+        message->correlation_id,
+        (unsigned)message->topic,
+        (unsigned)message->source_endpoint,
+        (unsigned)message->target_endpoint
+    );
     if (try_handle_diagnostics_request(state, source_client_index, message)) {
+        broker_tracef(state, "diagnostics handled for client=%zu", source_client_index);
         return;
     }
 
@@ -732,6 +786,7 @@ static void route_incoming_message(
         topic_route = find_topic_route(state, message->topic, !state->explicit_topic_routes_only);
         if (topic_route == NULL) {
             state->metrics.dropped += 1u;
+            broker_tracef(state, "drop reason=no_topic_route topic=0x%08x", (unsigned)message->topic);
             return;
         }
         if (topic_route->has_configured_endpoints) {
@@ -759,12 +814,19 @@ static void route_incoming_message(
             if (message->kind == CD_MESSAGE_REQUEST) {
                 state->metrics.timeouts += 1u;
             }
+            broker_tracef(
+                state,
+                "drop reason=unknown_target_endpoint target=%u kind=%s",
+                (unsigned)message->target_endpoint,
+                broker_message_kind_string(message->kind)
+            );
             return;
         }
 
         target_mask = (1ull << target_client_index);
     } else {
         state->metrics.dropped += 1u;
+        broker_tracef(state, "drop reason=unknown_message_kind kind=%u", (unsigned)message->kind);
         return;
     }
 
@@ -775,6 +837,7 @@ static void route_incoming_message(
         if (message->kind == CD_MESSAGE_REQUEST) {
             state->metrics.timeouts += 1u;
         }
+        broker_tracef(state, "drop reason=no_targets kind=%s", broker_message_kind_string(message->kind));
         return;
     }
 
@@ -788,11 +851,26 @@ static void route_incoming_message(
         send_status = state->clients[i].transport.send(state->clients[i].transport.impl, message);
         if (send_status == CD_STATUS_OK) {
             state->metrics.delivered += 1u;
+            broker_tracef(
+                state,
+                "send ok src_client=%zu dst_client=%zu kind=%s msg=%" PRIu64,
+                source_client_index,
+                i,
+                broker_message_kind_string(message->kind),
+                message->message_id
+            );
             continue;
         }
 
         state->metrics.transport_errors += 1u;
         state->metrics.dropped += 1u;
+        broker_tracef(
+            state,
+            "send failed src_client=%zu dst_client=%zu status=%s",
+            source_client_index,
+            i,
+            cd_status_string(send_status)
+        );
         if (send_status == CD_STATUS_TRANSPORT_UNAVAILABLE ||
             send_status == CD_STATUS_SCHEMA_MISMATCH) {
             disconnect_client(state, i);
@@ -942,6 +1020,7 @@ int main(int argc, char **argv)
 
     memset(&state, 0, sizeof(state));
     state.next_generated_message_id = 1u;
+    state.trace_enabled = config.trace_enabled;
     if (cd_context_init(&state.context, NULL) != CD_STATUS_OK) {
         fprintf(stderr, "Broker failed to initialize conduit context.\n");
         return 1;

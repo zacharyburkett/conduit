@@ -156,6 +156,9 @@ Optional debug hooks:
 - trace callback per envelope
 - topic-level sampling
 
+Current implementation includes bus trace hook API (`cd_bus_set_trace_hook`)
+with enqueue/dispatch/transport/reply-capture event emission.
+
 ## Security and Isolation Notes
 
 For local IPC:

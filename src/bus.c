@@ -10,6 +10,44 @@ enum {
     CD_DEFAULT_TRANSPORT_CAPACITY = 8
 };
 
+static void emit_trace_event(cd_bus_t *bus, const cd_trace_event_t *event)
+{
+    if (bus == NULL || event == NULL || bus->trace_hook == NULL) {
+        return;
+    }
+    bus->trace_hook(bus->trace_user_data, event);
+}
+
+static cd_trace_event_t make_trace_event_from_envelope(
+    const cd_envelope_t *envelope,
+    cd_trace_event_kind_t kind,
+    cd_status_t status,
+    size_t queue_count,
+    size_t queue_capacity,
+    size_t transport_index,
+    size_t processed_messages
+)
+{
+    cd_trace_event_t event;
+
+    memset(&event, 0, sizeof(event));
+    event.kind = kind;
+    event.status = status;
+    event.queue_count = queue_count;
+    event.queue_capacity = queue_capacity;
+    event.transport_index = transport_index;
+    event.processed_messages = processed_messages;
+    if (envelope != NULL) {
+        event.message_kind = envelope->kind;
+        event.message_id = envelope->message_id;
+        event.correlation_id = envelope->correlation_id;
+        event.topic = envelope->topic;
+        event.source_endpoint = envelope->source_endpoint;
+        event.target_endpoint = envelope->target_endpoint;
+    }
+    return event;
+}
+
 static bool size_mul_overflow(size_t a, size_t b, size_t *out_result)
 {
     if (a > 0u && b > SIZE_MAX / a) {
@@ -311,6 +349,21 @@ static cd_status_t capture_reply_for_inflight_request(
     request->reply_schema_id = reply_envelope->schema_id;
     request->reply_schema_version = reply_envelope->schema_version;
     request->state = CD_REQUEST_READY;
+    emit_trace_event(
+        bus,
+        &(cd_trace_event_t){
+            .kind = CD_TRACE_EVENT_REPLY_CAPTURE,
+            .status = current_status,
+            .message_kind = reply_envelope->kind,
+            .message_id = reply_envelope->message_id,
+            .correlation_id = reply_envelope->correlation_id,
+            .topic = reply_envelope->topic,
+            .source_endpoint = reply_envelope->source_endpoint,
+            .target_endpoint = reply_envelope->target_endpoint,
+            .queue_count = bus->queue_count,
+            .queue_capacity = bus->queue_capacity
+        }
+    );
 
     return current_status;
 }
@@ -356,6 +409,7 @@ static cd_status_t forward_message_to_transports(
     for (i = 0; i < bus->transport_capacity; ++i) {
         cd_transport_t *transport;
         cd_status_t send_status;
+        cd_trace_event_t trace_event;
 
         transport = bus->transports[i];
         if (transport == NULL || transport->send == NULL) {
@@ -363,6 +417,16 @@ static cd_status_t forward_message_to_transports(
         }
 
         send_status = transport->send(transport->impl, &envelope);
+        trace_event = make_trace_event_from_envelope(
+            &envelope,
+            CD_TRACE_EVENT_TRANSPORT_SEND,
+            send_status,
+            bus->queue_count,
+            bus->queue_capacity,
+            i,
+            0u
+        );
+        emit_trace_event(bus, &trace_event);
         if (current_status == CD_STATUS_OK && send_status != CD_STATUS_OK) {
             current_status = send_status;
         }
@@ -396,6 +460,8 @@ static cd_status_t enqueue_message(
     uint64_t timestamp_ns;
     void *payload_copy;
     cd_status_t status;
+    cd_trace_event_t trace_event;
+    cd_envelope_t trace_envelope;
 
     if (out_message_id != NULL) {
         *out_message_id = 0;
@@ -405,7 +471,24 @@ static cd_status_t enqueue_message(
         return CD_STATUS_INVALID_ARGUMENT;
     }
 
+    memset(&trace_envelope, 0, sizeof(trace_envelope));
+    trace_envelope.kind = kind;
+    trace_envelope.topic = topic;
+    trace_envelope.correlation_id = correlation_id;
+    trace_envelope.source_endpoint = source_endpoint;
+    trace_envelope.target_endpoint = target_endpoint;
+
     if (bus->queue_count == bus->queue_capacity) {
+        trace_event = make_trace_event_from_envelope(
+            &trace_envelope,
+            CD_TRACE_EVENT_ENQUEUE,
+            CD_STATUS_QUEUE_FULL,
+            bus->queue_count,
+            bus->queue_capacity,
+            SIZE_MAX,
+            0u
+        );
+        emit_trace_event(bus, &trace_event);
         return CD_STATUS_QUEUE_FULL;
     }
 
@@ -416,6 +499,16 @@ static cd_status_t enqueue_message(
     if (payload_size > 0u) {
         payload_copy = cd_context_alloc(bus->context, payload_size);
         if (payload_copy == NULL) {
+            trace_event = make_trace_event_from_envelope(
+                &trace_envelope,
+                CD_TRACE_EVENT_ENQUEUE,
+                CD_STATUS_ALLOCATION_FAILED,
+                bus->queue_count,
+                bus->queue_capacity,
+                SIZE_MAX,
+                0u
+            );
+            emit_trace_event(bus, &trace_event);
             return CD_STATUS_ALLOCATION_FAILED;
         }
         memcpy(payload_copy, payload, payload_size);
@@ -456,6 +549,7 @@ static cd_status_t enqueue_message(
     if (out_message_id != NULL) {
         *out_message_id = slot->envelope.message_id;
     }
+    trace_envelope.message_id = slot->envelope.message_id;
 
     status = CD_STATUS_OK;
     if (forward_to_transports) {
@@ -476,6 +570,17 @@ static cd_status_t enqueue_message(
             status
         );
     }
+
+    trace_event = make_trace_event_from_envelope(
+        &trace_envelope,
+        CD_TRACE_EVENT_ENQUEUE,
+        status,
+        bus->queue_count,
+        bus->queue_capacity,
+        SIZE_MAX,
+        0u
+    );
+    emit_trace_event(bus, &trace_event);
 
     return status;
 }
@@ -635,6 +740,16 @@ void cd_bus_destroy(cd_bus_t *bus)
     cd_context_free(bus->context, bus);
 }
 
+void cd_bus_set_trace_hook(cd_bus_t *bus, cd_trace_hook_fn trace_hook, void *trace_user_data)
+{
+    if (bus == NULL) {
+        return;
+    }
+
+    bus->trace_hook = trace_hook;
+    bus->trace_user_data = trace_user_data;
+}
+
 cd_status_t cd_bus_attach_transport(cd_bus_t *bus, cd_transport_t *transport)
 {
     size_t i;
@@ -715,6 +830,7 @@ static cd_status_t poll_transports(cd_bus_t *bus, cd_status_t current_status)
         size_t available;
         size_t polled_count;
         cd_status_t poll_status;
+        cd_trace_event_t trace_event;
 
         transport = bus->transports[i];
         if (transport == NULL || transport->poll == NULL) {
@@ -734,6 +850,16 @@ static cd_status_t poll_transports(cd_bus_t *bus, cd_status_t current_status)
             available,
             &polled_count
         );
+        trace_event = make_trace_event_from_envelope(
+            NULL,
+            CD_TRACE_EVENT_TRANSPORT_POLL,
+            poll_status,
+            bus->queue_count,
+            bus->queue_capacity,
+            i,
+            polled_count
+        );
+        emit_trace_event(bus, &trace_event);
         if (current_status == CD_STATUS_OK && poll_status != CD_STATUS_OK) {
             current_status = poll_status;
         }
@@ -774,16 +900,22 @@ cd_status_t cd_bus_pump(cd_bus_t *bus, size_t max_messages, size_t *out_processe
     while (processed < limit && bus->queue_count > 0u) {
         cd_queued_message_t *message;
         bool should_dispatch;
+        cd_status_t message_status;
+        cd_trace_event_t trace_event;
 
         message = &bus->queue[bus->queue_head];
         should_dispatch = true;
+        message_status = CD_STATUS_OK;
 
         if (message->envelope.kind == CD_MESSAGE_REPLY) {
-            dispatch_status = capture_reply_for_inflight_request(
+            message_status = capture_reply_for_inflight_request(
                 bus,
                 &message->envelope,
                 dispatch_status
             );
+            if (dispatch_status == CD_STATUS_OK && message_status != CD_STATUS_OK) {
+                dispatch_status = message_status;
+            }
         } else if (message->envelope.kind == CD_MESSAGE_REQUEST) {
             cd_inflight_request_t *request;
 
@@ -796,10 +928,24 @@ cd_status_t cd_bus_pump(cd_bus_t *bus, size_t max_messages, size_t *out_processe
         }
 
         if (should_dispatch && message->envelope.kind != CD_MESSAGE_REPLY) {
-            dispatch_status = dispatch_message_to_subscribers(bus, &message->envelope, dispatch_status);
+            message_status = dispatch_message_to_subscribers(bus, &message->envelope, dispatch_status);
+            if (dispatch_status == CD_STATUS_OK && message_status != CD_STATUS_OK) {
+                dispatch_status = message_status;
+            }
         } else {
             /* Message intentionally dropped (stale request or internal reply handling). */
         }
+
+        trace_event = make_trace_event_from_envelope(
+            &message->envelope,
+            CD_TRACE_EVENT_DISPATCH,
+            message_status,
+            bus->queue_count,
+            bus->queue_capacity,
+            SIZE_MAX,
+            processed + 1u
+        );
+        emit_trace_event(bus, &trace_event);
 
         if (message->payload_copy != NULL) {
             cd_context_free(bus->context, message->payload_copy);

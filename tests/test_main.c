@@ -116,6 +116,15 @@ typedef struct loadgen_summary {
     double throughput_msg_per_s;
 } loadgen_summary_t;
 
+typedef struct trace_capture_state {
+    int total;
+    int enqueue_count;
+    int dispatch_count;
+    int reply_capture_count;
+    int transport_send_count;
+    int transport_poll_count;
+} trace_capture_state_t;
+
 static void close_fd_if_open(int *fd)
 {
     if (fd != NULL && *fd >= 0) {
@@ -775,6 +784,37 @@ static cd_status_t generic_handler(void *user_data, const cd_envelope_t *message
     return state->return_status;
 }
 
+static void trace_capture_handler(void *user_data, const cd_trace_event_t *event)
+{
+    trace_capture_state_t *state;
+
+    state = (trace_capture_state_t *)user_data;
+    if (state == NULL || event == NULL) {
+        return;
+    }
+
+    state->total += 1;
+    switch (event->kind) {
+    case CD_TRACE_EVENT_ENQUEUE:
+        state->enqueue_count += 1;
+        break;
+    case CD_TRACE_EVENT_DISPATCH:
+        state->dispatch_count += 1;
+        break;
+    case CD_TRACE_EVENT_REPLY_CAPTURE:
+        state->reply_capture_count += 1;
+        break;
+    case CD_TRACE_EVENT_TRANSPORT_SEND:
+        state->transport_send_count += 1;
+        break;
+    case CD_TRACE_EVENT_TRANSPORT_POLL:
+        state->transport_poll_count += 1;
+        break;
+    default:
+        break;
+    }
+}
+
 static cd_status_t request_replier_handler(void *user_data, const cd_envelope_t *message)
 {
     request_replier_state_t *state;
@@ -1225,6 +1265,112 @@ static int test_pump_returns_first_callback_error(void)
     ASSERT_TRUE(capture.count == 2);
     ASSERT_TRUE(capture.markers[0] == 1);
     ASSERT_TRUE(capture.markers[1] == 2);
+
+    teardown_runtime(&runtime);
+    return 0;
+}
+
+static int test_trace_hook_reports_core_events(void)
+{
+    test_runtime_t runtime;
+    trace_capture_state_t trace_state;
+    cd_subscription_desc_t event_sub;
+    cd_subscription_desc_t request_sub;
+    handler_state_t event_handler;
+    capture_state_t capture;
+    request_replier_state_t replier_state;
+    cd_publish_params_t publish;
+    cd_request_params_t request;
+    cd_request_token_t token;
+    cd_reply_t reply;
+    int ready;
+    size_t processed;
+    int total_before_disable;
+
+    ASSERT_TRUE(setup_runtime_full(16u, 16u, 8u, NULL, &runtime) == 0);
+    memset(&trace_state, 0, sizeof(trace_state));
+    cd_bus_set_trace_hook(runtime.bus, trace_capture_handler, &trace_state);
+
+    memset(&capture, 0, sizeof(capture));
+    memset(&event_handler, 0, sizeof(event_handler));
+    event_handler.capture = &capture;
+    event_handler.marker = 1;
+    event_handler.return_status = CD_STATUS_OK;
+
+    memset(&event_sub, 0, sizeof(event_sub));
+    event_sub.endpoint = 77u;
+    event_sub.topic = 7001u;
+    event_sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_EVENT);
+    event_sub.handler = generic_handler;
+    event_sub.user_data = &event_handler;
+    ASSERT_STATUS(cd_subscribe(runtime.bus, &event_sub, NULL), CD_STATUS_OK);
+
+    memset(&replier_state, 0, sizeof(replier_state));
+    replier_state.bus = runtime.bus;
+    replier_state.reply_payload = "trace-reply";
+    replier_state.reply_payload_size = strlen("trace-reply");
+
+    memset(&request_sub, 0, sizeof(request_sub));
+    request_sub.endpoint = 88u;
+    request_sub.topic = 7002u;
+    request_sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_REQUEST);
+    request_sub.handler = request_replier_handler;
+    request_sub.user_data = &replier_state;
+    ASSERT_STATUS(cd_subscribe(runtime.bus, &request_sub, NULL), CD_STATUS_OK);
+
+    memset(&publish, 0, sizeof(publish));
+    publish.source_endpoint = 7u;
+    publish.topic = 7001u;
+    publish.flags = CD_MESSAGE_FLAG_LOCAL_ONLY;
+    publish.payload = "trace-event";
+    publish.payload_size = strlen("trace-event");
+    ASSERT_STATUS(cd_publish(runtime.bus, &publish, NULL), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_pump(runtime.bus, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(processed == 1u);
+
+    memset(&request, 0, sizeof(request));
+    request.source_endpoint = 9u;
+    request.target_endpoint = 88u;
+    request.topic = 7002u;
+    request.schema_id = 1u;
+    request.schema_version = 1u;
+    request.flags = CD_MESSAGE_FLAG_LOCAL_ONLY;
+    request.timeout_ns = 2000000000ull;
+    request.payload = "trace-request";
+    request.payload_size = strlen("trace-request");
+    token = 0u;
+    ASSERT_STATUS(cd_request_async(runtime.bus, &request, &token), CD_STATUS_OK);
+    ASSERT_TRUE(token != 0u);
+
+    ASSERT_STATUS(cd_bus_pump(runtime.bus, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(processed >= 1u);
+    ASSERT_STATUS(cd_bus_pump(runtime.bus, 0u, &processed), CD_STATUS_OK);
+
+    ready = 0;
+    memset(&reply, 0, sizeof(reply));
+    ASSERT_STATUS(cd_poll_reply(runtime.bus, token, &reply, &ready), CD_STATUS_OK);
+    ASSERT_TRUE(ready == 1);
+    cd_reply_dispose(runtime.bus, &reply);
+
+    ASSERT_TRUE(trace_state.total > 0);
+    ASSERT_TRUE(trace_state.enqueue_count >= 3);
+    ASSERT_TRUE(trace_state.dispatch_count >= 3);
+    ASSERT_TRUE(trace_state.reply_capture_count >= 1);
+    ASSERT_TRUE(trace_state.transport_send_count == 0);
+    ASSERT_TRUE(trace_state.transport_poll_count == 0);
+
+    total_before_disable = trace_state.total;
+    cd_bus_set_trace_hook(runtime.bus, NULL, NULL);
+
+    memset(&publish, 0, sizeof(publish));
+    publish.source_endpoint = 7u;
+    publish.topic = 7001u;
+    publish.flags = CD_MESSAGE_FLAG_LOCAL_ONLY;
+    publish.payload = "trace-off";
+    publish.payload_size = strlen("trace-off");
+    ASSERT_STATUS(cd_publish(runtime.bus, &publish, NULL), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_pump(runtime.bus, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(trace_state.total == total_before_disable);
 
     teardown_runtime(&runtime);
     return 0;
@@ -3652,6 +3798,7 @@ int main(void)
     RUN_TEST(test_pump_limit_and_message_id_order);
     RUN_TEST(test_subscription_capacity_and_validation);
     RUN_TEST(test_pump_returns_first_callback_error);
+    RUN_TEST(test_trace_hook_reports_core_events);
     RUN_TEST(test_request_reply_roundtrip_and_dispose);
     RUN_TEST(test_request_timeout_with_fake_clock);
     RUN_TEST(test_request_inflight_capacity_and_validation);

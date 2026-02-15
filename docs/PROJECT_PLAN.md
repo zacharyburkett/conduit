@@ -169,6 +169,13 @@ Status:
   - tests now wait for broker readiness before spawning loadgen
   - test loadgen invocations use higher connect-attempt tolerance
   - soak/profile/stress runtime margins widened for slower CI runners
+- Trace hooks start added:
+  - public API: `cd_bus_set_trace_hook`
+  - core trace events: enqueue/dispatch/reply-capture/transport-send/transport-poll
+  - unit test added: `tests/test_main.c` (`test_trace_hook_reports_core_events`)
+  - app trace modes:
+    - broker `--trace` (routing trace lines)
+    - loadgen `--trace` (per-bus trace lines via hook API)
 
 ## Test Matrix
 

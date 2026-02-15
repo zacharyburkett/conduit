@@ -69,6 +69,7 @@ Optional flags:
 - `--metrics-interval-ms <n>`
 - `--run-ms <n>`
 - `--routes-file <path>`
+- `--trace`
 
 Route file format:
 
@@ -119,6 +120,7 @@ Optional flags:
 - `--max-queued-messages <n>`
 - `--max-inflight-requests <n>`
 - `--connect-attempts <n>`
+- `--trace`
 
 Loadgen summary now includes:
 - overall throughput (`throughput_msg_per_s`)
@@ -132,6 +134,21 @@ and reliability stress scenarios.
 
 Reliability tests now include malformed-frame burst and disconnect-storm
 scenarios under active load.
+
+## Bus Trace Hooks (Phase 6 Start)
+
+The bus now supports optional trace callbacks:
+
+- API: `cd_bus_set_trace_hook`
+- Event kinds:
+  - `CD_TRACE_EVENT_ENQUEUE`
+  - `CD_TRACE_EVENT_DISPATCH`
+  - `CD_TRACE_EVENT_REPLY_CAPTURE`
+  - `CD_TRACE_EVENT_TRANSPORT_SEND`
+  - `CD_TRACE_EVENT_TRANSPORT_POLL`
+
+Trace hooks are exercised by unit test
+`test_trace_hook_reports_core_events`.
 
 ## Transport Layer (Phase 4 Start)
 

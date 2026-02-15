@@ -63,6 +63,25 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - Cross-process event and request/reply flow is validated with a forked
   two-process integration test.
 
+## Trace Hook Semantics (Phase 6 Start)
+
+- `cd_bus_set_trace_hook(bus, hook, user_data)` installs an optional callback.
+- Passing `hook=NULL` disables tracing.
+- Trace callback receives `cd_trace_event_t` snapshots with:
+  - event kind
+  - status
+  - envelope metadata (kind/message_id/correlation/topic/source/target)
+  - queue counters
+  - transport index / processed-message counts when applicable
+- Current emitted event kinds:
+  - `CD_TRACE_EVENT_ENQUEUE`
+  - `CD_TRACE_EVENT_DISPATCH`
+  - `CD_TRACE_EVENT_REPLY_CAPTURE`
+  - `CD_TRACE_EVENT_TRANSPORT_SEND`
+  - `CD_TRACE_EVENT_TRANSPORT_POLL`
+- Trace hook coverage includes unit test:
+  - `tests/test_main.c` (`test_trace_hook_reports_core_events`)
+
 ## IPC Frame Codec Semantics
 
 - `cd_ipc_encode_envelope` writes a fixed 64-byte header plus payload bytes.
@@ -98,6 +117,7 @@ This document freezes the initial API behavior and ownership rules for the scaff
   expected counters.
 - Integration coverage includes a direct diagnostics request/reply validation:
   - `tests/test_main.c` (`test_broker_diagnostics_request_endpoint`)
+- Broker supports optional verbose routing trace output with `--trace`.
 
 ## Load/Soak Harness Semantics (Phase 6 Start)
 
@@ -107,6 +127,7 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - Loadgen supports queue/inflight tuning flags:
   - `--max-queued-messages`
   - `--max-inflight-requests`
+- Loadgen supports optional bus trace output with `--trace`.
 - Loadgen summary output includes:
   - throughput (`throughput_msg_per_s`)
   - phase timing (`event_phase_ms`, `request_phase_ms`)

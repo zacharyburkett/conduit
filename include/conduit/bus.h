@@ -23,6 +23,31 @@ typedef struct cd_bus_config {
 
 typedef cd_status_t (*cd_message_handler_fn)(void *user_data, const cd_envelope_t *message);
 
+typedef enum cd_trace_event_kind {
+    CD_TRACE_EVENT_ENQUEUE = 0,
+    CD_TRACE_EVENT_DISPATCH = 1,
+    CD_TRACE_EVENT_REPLY_CAPTURE = 2,
+    CD_TRACE_EVENT_TRANSPORT_SEND = 3,
+    CD_TRACE_EVENT_TRANSPORT_POLL = 4
+} cd_trace_event_kind_t;
+
+typedef struct cd_trace_event {
+    cd_trace_event_kind_t kind;
+    cd_status_t status;
+    cd_message_kind_t message_kind;
+    cd_message_id_t message_id;
+    cd_message_id_t correlation_id;
+    cd_topic_t topic;
+    cd_endpoint_id_t source_endpoint;
+    cd_endpoint_id_t target_endpoint;
+    size_t queue_count;
+    size_t queue_capacity;
+    size_t transport_index;
+    size_t processed_messages;
+} cd_trace_event_t;
+
+typedef void (*cd_trace_hook_fn)(void *user_data, const cd_trace_event_t *event);
+
 typedef struct cd_subscription_desc {
     /*
      * Endpoint identity for this subscriber.
@@ -90,6 +115,12 @@ typedef struct cd_reply {
 
 cd_status_t cd_bus_create(cd_context_t *context, const cd_bus_config_t *config, cd_bus_t **out_bus);
 void cd_bus_destroy(cd_bus_t *bus);
+
+/*
+ * Sets an optional trace callback invoked on key bus lifecycle events.
+ * Passing NULL disables tracing.
+ */
+void cd_bus_set_trace_hook(cd_bus_t *bus, cd_trace_hook_fn trace_hook, void *trace_user_data);
 
 /*
  * Attach/detach transport endpoints to a bus.

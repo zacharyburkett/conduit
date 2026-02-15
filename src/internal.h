@@ -63,6 +63,8 @@ struct cd_bus {
     size_t inflight_request_capacity;
     cd_transport_t **transports;
     size_t transport_capacity;
+    cd_trace_hook_fn trace_hook;
+    void *trace_user_data;
     cd_subscription_id_t next_subscription_id;
     cd_message_id_t next_message_id;
     cd_request_token_t next_request_token;

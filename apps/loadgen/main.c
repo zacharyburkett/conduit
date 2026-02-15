@@ -38,6 +38,7 @@ typedef struct loadgen_config {
     uint64_t max_duration_ms;
     size_t max_queued_messages;
     size_t max_inflight_requests;
+    bool trace_enabled;
     int connect_attempts;
     useconds_t connect_retry_sleep_us;
 } loadgen_config_t;
@@ -88,6 +89,56 @@ static bool parse_u64_arg(const char *text, uint64_t *out_value)
     return true;
 }
 
+static const char *trace_event_kind_string(cd_trace_event_kind_t kind)
+{
+    switch (kind) {
+    case CD_TRACE_EVENT_ENQUEUE:
+        return "enqueue";
+    case CD_TRACE_EVENT_DISPATCH:
+        return "dispatch";
+    case CD_TRACE_EVENT_REPLY_CAPTURE:
+        return "reply-capture";
+    case CD_TRACE_EVENT_TRANSPORT_SEND:
+        return "transport-send";
+    case CD_TRACE_EVENT_TRANSPORT_POLL:
+        return "transport-poll";
+    default:
+        return "unknown";
+    }
+}
+
+static void on_bus_trace(void *user_data, const cd_trace_event_t *event)
+{
+    const char *label;
+
+    label = (const char *)user_data;
+    if (event == NULL) {
+        return;
+    }
+    if (label == NULL) {
+        label = "bus";
+    }
+
+    printf(
+        "[loadgen-trace] bus=%s kind=%s status=%s msg_kind=%u msg_id=%" PRIu64
+        " corr_id=%" PRIu64 " topic=0x%08x src=%u dst=%u"
+        " queue=%zu/%zu transport=%zu processed=%zu\n",
+        label,
+        trace_event_kind_string(event->kind),
+        cd_status_string(event->status),
+        (unsigned)event->message_kind,
+        event->message_id,
+        event->correlation_id,
+        (unsigned)event->topic,
+        (unsigned)event->source_endpoint,
+        (unsigned)event->target_endpoint,
+        event->queue_count,
+        event->queue_capacity,
+        event->transport_index,
+        event->processed_messages
+    );
+}
+
 static void print_usage(const char *program_name)
 {
     printf(
@@ -101,6 +152,7 @@ static void print_usage(const char *program_name)
         "  --max-queued-messages <n> default 4096\n"
         "  --max-inflight-requests <n> default 256\n"
         "  --connect-attempts <n>    default 3000\n"
+        "  --trace                   emit bus trace lines\n"
         "  --help\n",
         program_name
     );
@@ -123,6 +175,7 @@ static bool parse_args(int argc, char **argv, loadgen_config_t *out_config)
     config.max_duration_ms = 15000u;
     config.max_queued_messages = 4096u;
     config.max_inflight_requests = 256u;
+    config.trace_enabled = false;
     config.connect_attempts = 3000;
     config.connect_retry_sleep_us = 1000u;
 
@@ -135,6 +188,11 @@ static bool parse_args(int argc, char **argv, loadgen_config_t *out_config)
         if (strcmp(arg, "--help") == 0) {
             print_usage(argv[0]);
             return false;
+        }
+        if (strcmp(arg, "--trace") == 0) {
+            config.trace_enabled = true;
+            i += 1;
+            continue;
         }
         if (i + 1 >= argc) {
             fprintf(stderr, "Missing value for option: %s\n", arg);
@@ -423,6 +481,10 @@ int main(int argc, char **argv)
         cd_bus_destroy(bus_replier);
         cd_context_shutdown(context);
         return 1;
+    }
+    if (config.trace_enabled) {
+        cd_bus_set_trace_hook(bus_sender, on_bus_trace, "sender");
+        cd_bus_set_trace_hook(bus_replier, on_bus_trace, "replier");
     }
 
     state.bus_replier = bus_replier;
