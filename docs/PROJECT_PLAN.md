@@ -141,6 +141,14 @@ Status:
   - `apps/loadgen/main.c`
 - Soak integration test added:
   - `tests/test_main.c` (`test_loadgen_soak_against_broker`)
+- Malformed-frame burst stress test added:
+  - `tests/test_main.c` (`test_broker_malformed_frame_burst_under_load`)
+- Disconnect storm stress test added:
+  - `tests/test_main.c` (`test_broker_disconnect_storm_under_load`)
+- Diagnostics endpoint start added:
+  - reserved broker request/reply endpoint (`0xFFFFFFFE`)
+  - metrics snapshot text payload reply (`clients/published/delivered/dropped/timeouts/transport_errors`)
+  - integration test `tests/test_main.c` (`test_broker_diagnostics_request_endpoint`)
 
 ## Test Matrix
 

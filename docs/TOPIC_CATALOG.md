@@ -29,6 +29,16 @@ This catalog defines initial topic and endpoint conventions used by the embedded
   - Request payload schema: `CD_SCHEMA_ENTITY_SPAWN_REQUEST_V1`
   - Reply payload schema: `CD_SCHEMA_ENTITY_SPAWN_REPLY_V1`
 
+## Broker Reserved Diagnostics
+
+- `broker.metrics.snapshot` (`0x00B00001`)
+  - Kind: `CD_MESSAGE_REQUEST` + `CD_MESSAGE_REPLY`
+  - Request target endpoint: `0xFFFFFFFE`
+  - Reply source endpoint: `0xFFFFFFFE`
+  - Reply schema: `0x00B00001` version `1`
+  - Reply payload text:
+    `clients=<n> published=<n> delivered=<n> dropped=<n> timeouts=<n> transport_errors=<n>`
+
 ## Endpoint Convention
 
 - `CD_ENDPOINT_FRAME_LOOP = 1`

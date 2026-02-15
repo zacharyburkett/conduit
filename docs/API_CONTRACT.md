@@ -82,11 +82,20 @@ This document freezes the initial API behavior and ownership rules for the scaff
   from source endpoints on incoming messages.
 - Broker metrics currently expose published/delivered/dropped/timeouts and
   transport error counts.
+- Broker exposes a reserved diagnostics request endpoint:
+  - target endpoint: `0xFFFFFFFE`
+  - request topic: `0x00B00001`
+  - reply topic: `0x00B00001`
+  - reply schema: `0x00B00001` version `1`
+- Diagnostics reply payload is text:
+  - `clients=<n> published=<n> delivered=<n> dropped=<n> timeouts=<n> transport_errors=<n>`
 - Route file line format is:
   - `topic <topic_id> <endpoint_id> [endpoint_id...]`
 - Integration coverage includes reconnect and broker restart recovery paths.
 - Integration tests also parse broker final metrics output and validate minimum
   expected counters.
+- Integration coverage includes a direct diagnostics request/reply validation:
+  - `tests/test_main.c` (`test_broker_diagnostics_request_endpoint`)
 
 ## Load/Soak Harness Semantics (Phase 6 Start)
 
@@ -95,6 +104,8 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - Loadgen validates message counts and reply correlation under bounded runtime.
 - Integration test `test_loadgen_soak_against_broker` validates broker behavior
   under synthetic load.
+- Additional stress tests validate broker resilience under malformed-frame
+  bursts and client disconnect storms while load traffic is active.
 
 ## Phase Boundaries
 

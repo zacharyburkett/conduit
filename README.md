@@ -72,6 +72,24 @@ topic 0x00020001 20 21
 Test coverage includes broker reconnect and broker restart recovery scenarios.
 Broker integration tests also validate broker final metrics output counters.
 
+## Broker Diagnostics Endpoint (Phase 6)
+
+The broker now exposes a reserved request/reply endpoint for runtime metrics:
+
+- endpoint: `0xFFFFFFFE`
+- request topic: `0x00B00001`
+- reply topic: `0x00B00001`
+- reply schema: `0x00B00001` version `1`
+
+Reply payload is UTF-8 text with key/value counters:
+
+```txt
+clients=<n> published=<n> delivered=<n> dropped=<n> timeouts=<n> transport_errors=<n>
+```
+
+Integration coverage includes a direct request/reply diagnostics test against a
+live broker process (`test_broker_diagnostics_request_endpoint`).
+
 ## Load Generator (Phase 6 Start)
 
 Run a synthetic load pass against a running broker:
@@ -85,6 +103,9 @@ Optional flags:
 - `--request-timeout-ns <n>`
 - `--max-duration-ms <n>`
 - `--connect-attempts <n>`
+
+Reliability tests now include malformed-frame burst and disconnect-storm
+scenarios under active load.
 
 ## Transport Layer (Phase 4 Start)
 

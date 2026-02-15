@@ -19,7 +19,10 @@ enum {
     CD_BROKER_DEFAULT_MAX_TOPIC_ROUTES = 256,
     CD_BROKER_DEFAULT_MAX_ENDPOINT_ROUTES = 512,
     CD_BROKER_DEFAULT_METRICS_INTERVAL_MS = 1000u,
-    CD_BROKER_MAX_TOPIC_ENDPOINTS = 32
+    CD_BROKER_MAX_TOPIC_ENDPOINTS = 32,
+    CD_BROKER_DIAGNOSTICS_ENDPOINT = 0xFFFFFFFEu,
+    CD_BROKER_DIAGNOSTICS_TOPIC_METRICS = 0x00B00001u,
+    CD_BROKER_DIAGNOSTICS_SCHEMA_METRICS_TEXT = 0x00B00001u
 };
 
 typedef struct broker_config {
@@ -70,6 +73,7 @@ typedef struct broker_state {
     size_t endpoint_route_capacity;
     bool explicit_topic_routes_only;
     broker_metrics_t metrics;
+    cd_message_id_t next_generated_message_id;
 } broker_state_t;
 
 typedef struct broker_receive_context {
@@ -78,6 +82,8 @@ typedef struct broker_receive_context {
 } broker_receive_context_t;
 
 static volatile sig_atomic_t g_broker_running = 1;
+
+static size_t active_client_count(const broker_state_t *state);
 
 static void broker_signal_handler(int signum)
 {
@@ -599,6 +605,111 @@ static bool lookup_endpoint_route(
     return false;
 }
 
+static cd_message_id_t next_generated_message_id(broker_state_t *state)
+{
+    cd_message_id_t message_id;
+
+    if (state == NULL) {
+        return 0u;
+    }
+
+    message_id = state->next_generated_message_id++;
+    if (message_id == 0u) {
+        message_id = state->next_generated_message_id++;
+    }
+
+    return message_id;
+}
+
+static size_t write_metrics_snapshot_payload(const broker_state_t *state, char *buffer, size_t capacity)
+{
+    int written;
+
+    if (state == NULL || buffer == NULL || capacity == 0u) {
+        return 0u;
+    }
+
+    written = snprintf(
+        buffer,
+        capacity,
+        "clients=%zu published=%" PRIu64
+        " delivered=%" PRIu64 " dropped=%" PRIu64
+        " timeouts=%" PRIu64 " transport_errors=%" PRIu64,
+        active_client_count(state),
+        state->metrics.published,
+        state->metrics.delivered,
+        state->metrics.dropped,
+        state->metrics.timeouts,
+        state->metrics.transport_errors
+    );
+    if (written < 0) {
+        return 0u;
+    }
+    if ((size_t)written >= capacity) {
+        return capacity - 1u;
+    }
+    return (size_t)written;
+}
+
+static bool try_handle_diagnostics_request(
+    broker_state_t *state,
+    size_t source_client_index,
+    const cd_envelope_t *message
+)
+{
+    cd_envelope_t reply;
+    cd_status_t send_status;
+    char payload[192];
+    size_t payload_size;
+
+    if (state == NULL || message == NULL) {
+        return false;
+    }
+    if (source_client_index >= state->client_capacity ||
+        !state->clients[source_client_index].in_use) {
+        return false;
+    }
+    if (message->kind != CD_MESSAGE_REQUEST ||
+        message->target_endpoint != CD_BROKER_DIAGNOSTICS_ENDPOINT ||
+        message->source_endpoint == CD_ENDPOINT_NONE) {
+        return false;
+    }
+
+    payload_size = write_metrics_snapshot_payload(state, payload, sizeof(payload));
+    if (payload_size == 0u) {
+        return false;
+    }
+
+    memset(&reply, 0, sizeof(reply));
+    reply.message_id = next_generated_message_id(state);
+    reply.correlation_id = message->message_id;
+    reply.kind = CD_MESSAGE_REPLY;
+    reply.topic = CD_BROKER_DIAGNOSTICS_TOPIC_METRICS;
+    reply.source_endpoint = CD_BROKER_DIAGNOSTICS_ENDPOINT;
+    reply.target_endpoint = message->source_endpoint;
+    reply.schema_id = CD_BROKER_DIAGNOSTICS_SCHEMA_METRICS_TEXT;
+    reply.schema_version = 1u;
+    reply.payload = payload;
+    reply.payload_size = payload_size;
+
+    send_status = state->clients[source_client_index].transport.send(
+        state->clients[source_client_index].transport.impl,
+        &reply
+    );
+    if (send_status == CD_STATUS_OK) {
+        state->metrics.delivered += 1u;
+        return true;
+    }
+
+    state->metrics.transport_errors += 1u;
+    state->metrics.dropped += 1u;
+    if (send_status == CD_STATUS_TRANSPORT_UNAVAILABLE ||
+        send_status == CD_STATUS_SCHEMA_MISMATCH) {
+        disconnect_client(state, source_client_index);
+    }
+    return true;
+}
+
 static void route_incoming_message(
     broker_state_t *state,
     size_t source_client_index,
@@ -610,6 +721,9 @@ static void route_incoming_message(
 
     state->metrics.published += 1u;
     upsert_endpoint_route(state, message->source_endpoint, source_client_index);
+    if (try_handle_diagnostics_request(state, source_client_index, message)) {
+        return;
+    }
 
     target_mask = 0u;
     if (message->kind == CD_MESSAGE_EVENT) {
@@ -827,6 +941,7 @@ int main(int argc, char **argv)
     }
 
     memset(&state, 0, sizeof(state));
+    state.next_generated_message_id = 1u;
     if (cd_context_init(&state.context, NULL) != CD_STATUS_OK) {
         fprintf(stderr, "Broker failed to initialize conduit context.\n");
         return 1;

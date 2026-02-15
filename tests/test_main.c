@@ -19,6 +19,12 @@
 #define CONDUIT_LOADGEN_BIN "conduit_loadgen"
 #endif
 
+enum {
+    TEST_BROKER_DIAGNOSTICS_ENDPOINT = 0xFFFFFFFEu,
+    TEST_BROKER_DIAGNOSTICS_TOPIC_METRICS = 0x00B00001u,
+    TEST_BROKER_DIAGNOSTICS_SCHEMA_METRICS_TEXT = 0x00B00001u
+};
+
 #define ASSERT_TRUE(condition)                                                      \
     do {                                                                            \
         if (!(condition)) {                                                         \
@@ -410,6 +416,51 @@ static int parse_broker_final_metrics(
 
     fclose(file);
     return found ? 0 : 1;
+}
+
+static int parse_metrics_snapshot_payload(
+    const void *payload,
+    size_t payload_size,
+    size_t *out_clients,
+    broker_metrics_snapshot_t *out_metrics
+)
+{
+    char text[256];
+    unsigned long long published;
+    unsigned long long delivered;
+    unsigned long long dropped;
+    unsigned long long timeouts;
+    unsigned long long transport_errors;
+    size_t clients;
+
+    if (payload == NULL || out_clients == NULL || out_metrics == NULL ||
+        payload_size == 0u || payload_size >= sizeof(text)) {
+        return 1;
+    }
+
+    memset(text, 0, sizeof(text));
+    memcpy(text, payload, payload_size);
+    if (sscanf(
+            text,
+            "clients=%zu published=%llu delivered=%llu dropped=%llu "
+            "timeouts=%llu transport_errors=%llu",
+            &clients,
+            &published,
+            &delivered,
+            &dropped,
+            &timeouts,
+            &transport_errors
+        ) != 6) {
+        return 1;
+    }
+
+    *out_clients = clients;
+    out_metrics->published = (uint64_t)published;
+    out_metrics->delivered = (uint64_t)delivered;
+    out_metrics->dropped = (uint64_t)dropped;
+    out_metrics->timeouts = (uint64_t)timeouts;
+    out_metrics->transport_errors = (uint64_t)transport_errors;
+    return 0;
 }
 
 static void test_free_adapter(void *user_data, void *ptr)
@@ -2605,6 +2656,140 @@ static int test_broker_reconnect_without_restart(void)
     return 0;
 }
 
+static int test_broker_diagnostics_request_endpoint(void)
+{
+    cd_context_t *context;
+    cd_bus_t *bus;
+    cd_bus_config_t bus_config;
+    cd_transport_t transport;
+    cd_request_params_t request;
+    cd_request_token_t token;
+    cd_reply_t reply;
+    broker_metrics_snapshot_t payload_metrics;
+    broker_metrics_snapshot_t final_metrics;
+    size_t payload_clients;
+    size_t processed;
+    int fd;
+    pid_t broker_pid;
+    int broker_status;
+    int ready;
+    int i;
+    cd_status_t poll_status;
+    char socket_path[104];
+    char broker_log_path[128];
+
+    context = NULL;
+    bus = NULL;
+    memset(&transport, 0, sizeof(transport));
+    memset(&request, 0, sizeof(request));
+    memset(&reply, 0, sizeof(reply));
+    memset(&payload_metrics, 0, sizeof(payload_metrics));
+    memset(&final_metrics, 0, sizeof(final_metrics));
+    payload_clients = 0u;
+    token = 0u;
+    processed = 0u;
+    fd = -1;
+    broker_pid = -1;
+    broker_status = 0;
+    ready = 0;
+    i = 0;
+    poll_status = CD_STATUS_OK;
+
+    if (!unix_path_socket_bind_supported()) {
+        return 0;
+    }
+
+    snprintf(
+        socket_path,
+        sizeof(socket_path),
+        "/tmp/conduit-broker-diag-%ld-%u.sock",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    snprintf(
+        broker_log_path,
+        sizeof(broker_log_path),
+        "/tmp/conduit-broker-diag-log-%ld-%u.txt",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    unlink(socket_path);
+    unlink(broker_log_path);
+
+    broker_pid = spawn_broker_process(socket_path, NULL, "10000", "0", broker_log_path);
+    ASSERT_TRUE(broker_pid > 0);
+
+    fd = connect_unix_socket_retry(socket_path, 1200, 1000u);
+    ASSERT_TRUE(fd >= 0);
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 32u;
+    bus_config.max_subscriptions = 8u;
+    bus_config.max_inflight_requests = 8u;
+    bus_config.max_transports = 1u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus), CD_STATUS_OK);
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, fd, NULL, &transport), CD_STATUS_OK);
+    fd = -1;
+    ASSERT_STATUS(cd_bus_attach_transport(bus, &transport), CD_STATUS_OK);
+
+    request.source_endpoint = 777u;
+    request.target_endpoint = TEST_BROKER_DIAGNOSTICS_ENDPOINT;
+    request.topic = TEST_BROKER_DIAGNOSTICS_TOPIC_METRICS;
+    request.schema_id = TEST_BROKER_DIAGNOSTICS_SCHEMA_METRICS_TEXT;
+    request.schema_version = 1u;
+    request.flags = 0u;
+    request.timeout_ns = 2000000000ull;
+    request.payload = "metrics";
+    request.payload_size = strlen("metrics");
+    ASSERT_STATUS(cd_request_async(bus, &request, &token), CD_STATUS_OK);
+
+    for (i = 0; i < 3000; ++i) {
+        processed = 0u;
+        ASSERT_STATUS(cd_bus_pump(bus, 0u, &processed), CD_STATUS_OK);
+        poll_status = cd_poll_reply(bus, token, &reply, &ready);
+        if (poll_status == CD_STATUS_OK && ready == 1) {
+            break;
+        }
+        ASSERT_TRUE(poll_status == CD_STATUS_OK);
+        ASSERT_TRUE(ready == 0);
+        usleep(1000u);
+    }
+
+    ASSERT_TRUE(poll_status == CD_STATUS_OK);
+    ASSERT_TRUE(ready == 1);
+    ASSERT_TRUE(reply.schema_id == TEST_BROKER_DIAGNOSTICS_SCHEMA_METRICS_TEXT);
+    ASSERT_TRUE(reply.schema_version == 1u);
+    ASSERT_TRUE(reply.payload_size > 0u);
+    ASSERT_TRUE(
+        parse_metrics_snapshot_payload(
+            reply.payload,
+            reply.payload_size,
+            &payload_clients,
+            &payload_metrics
+        ) == 0
+    );
+    ASSERT_TRUE(payload_clients >= 1u);
+    ASSERT_TRUE(payload_metrics.published >= 1u);
+    ASSERT_TRUE(payload_metrics.delivered >= 1u);
+    cd_reply_dispose(bus, &reply);
+
+    cd_ipc_socket_transport_close(&transport);
+    cd_bus_destroy(bus);
+    cd_context_shutdown(context);
+
+    ASSERT_TRUE(stop_broker_process(broker_pid, &broker_status) == 0);
+    ASSERT_TRUE(WIFEXITED(broker_status));
+    ASSERT_TRUE(WEXITSTATUS(broker_status) == 0);
+    ASSERT_TRUE(parse_broker_final_metrics(broker_log_path, &final_metrics) == 0);
+    ASSERT_TRUE(final_metrics.published >= 1u);
+    ASSERT_TRUE(final_metrics.delivered >= 1u);
+
+    unlink(socket_path);
+    unlink(broker_log_path);
+    return 0;
+}
+
 static int test_broker_restart_with_client_reconnect(void)
 {
     cd_context_t *context;
@@ -2934,6 +3119,188 @@ static int test_loadgen_soak_against_broker(void)
     return 0;
 }
 
+static int test_broker_malformed_frame_burst_under_load(void)
+{
+    pid_t broker_pid;
+    pid_t loadgen_pid;
+    int broker_status;
+    int loadgen_status;
+    char socket_path[104];
+    char broker_log_path[128];
+    char loadgen_log_path[128];
+    broker_metrics_snapshot_t broker_metrics;
+    int i;
+
+    broker_pid = -1;
+    loadgen_pid = -1;
+    broker_status = 0;
+    loadgen_status = 0;
+
+    if (!unix_path_socket_bind_supported()) {
+        return 0;
+    }
+
+    snprintf(
+        socket_path,
+        sizeof(socket_path),
+        "/tmp/conduit-broker-malformed-%ld-%u.sock",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    snprintf(
+        broker_log_path,
+        sizeof(broker_log_path),
+        "/tmp/conduit-broker-malformed-log-%ld-%u.log",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    snprintf(
+        loadgen_log_path,
+        sizeof(loadgen_log_path),
+        "/tmp/conduit-loadgen-malformed-log-%ld-%u.log",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+
+    unlink(socket_path);
+    unlink(broker_log_path);
+    unlink(loadgen_log_path);
+
+    broker_pid = spawn_broker_process(socket_path, NULL, "25000", "0", broker_log_path);
+    ASSERT_TRUE(broker_pid > 0);
+
+    loadgen_pid = spawn_loadgen_process(
+        socket_path,
+        "1800",
+        "350",
+        "64",
+        "15000",
+        "2000000000",
+        loadgen_log_path
+    );
+    ASSERT_TRUE(loadgen_pid > 0);
+
+    for (i = 0; i < 32; ++i) {
+        int attacker_fd;
+        uint8_t malformed_frame[CD_IPC_FRAME_HEADER_SIZE];
+
+        attacker_fd = connect_unix_socket_retry(socket_path, 1200, 1000u);
+        ASSERT_TRUE(attacker_fd >= 0);
+        memset(malformed_frame, 0, sizeof(malformed_frame));
+        ASSERT_TRUE(
+            send(attacker_fd, malformed_frame, sizeof(malformed_frame), 0) ==
+            (ssize_t)sizeof(malformed_frame)
+        );
+        close_fd_if_open(&attacker_fd);
+        usleep(400u);
+    }
+
+    ASSERT_TRUE(waitpid(loadgen_pid, &loadgen_status, 0) == loadgen_pid);
+    ASSERT_TRUE(WIFEXITED(loadgen_status));
+    ASSERT_TRUE(WEXITSTATUS(loadgen_status) == 0);
+
+    ASSERT_TRUE(stop_broker_process(broker_pid, &broker_status) == 0);
+    ASSERT_TRUE(WIFEXITED(broker_status));
+    ASSERT_TRUE(WEXITSTATUS(broker_status) == 0);
+    ASSERT_TRUE(parse_broker_final_metrics(broker_log_path, &broker_metrics) == 0);
+    ASSERT_TRUE(broker_metrics.published >= 2500u);
+    ASSERT_TRUE(broker_metrics.delivered >= 2100u);
+    ASSERT_TRUE(broker_metrics.transport_errors >= 16u);
+
+    unlink(socket_path);
+    unlink(broker_log_path);
+    unlink(loadgen_log_path);
+    return 0;
+}
+
+static int test_broker_disconnect_storm_under_load(void)
+{
+    pid_t broker_pid;
+    pid_t loadgen_pid;
+    int broker_status;
+    int loadgen_status;
+    char socket_path[104];
+    char broker_log_path[128];
+    char loadgen_log_path[128];
+    broker_metrics_snapshot_t broker_metrics;
+    int i;
+
+    broker_pid = -1;
+    loadgen_pid = -1;
+    broker_status = 0;
+    loadgen_status = 0;
+
+    if (!unix_path_socket_bind_supported()) {
+        return 0;
+    }
+
+    snprintf(
+        socket_path,
+        sizeof(socket_path),
+        "/tmp/conduit-broker-storm-%ld-%u.sock",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    snprintf(
+        broker_log_path,
+        sizeof(broker_log_path),
+        "/tmp/conduit-broker-storm-log-%ld-%u.log",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+    snprintf(
+        loadgen_log_path,
+        sizeof(loadgen_log_path),
+        "/tmp/conduit-loadgen-storm-log-%ld-%u.log",
+        (long)getpid(),
+        (unsigned)rand()
+    );
+
+    unlink(socket_path);
+    unlink(broker_log_path);
+    unlink(loadgen_log_path);
+
+    broker_pid = spawn_broker_process(socket_path, NULL, "25000", "0", broker_log_path);
+    ASSERT_TRUE(broker_pid > 0);
+
+    loadgen_pid = spawn_loadgen_process(
+        socket_path,
+        "1800",
+        "350",
+        "64",
+        "15000",
+        "2000000000",
+        loadgen_log_path
+    );
+    ASSERT_TRUE(loadgen_pid > 0);
+
+    for (i = 0; i < 80; ++i) {
+        int transient_fd;
+
+        transient_fd = connect_unix_socket_retry(socket_path, 1200, 1000u);
+        ASSERT_TRUE(transient_fd >= 0);
+        close_fd_if_open(&transient_fd);
+        usleep(300u);
+    }
+
+    ASSERT_TRUE(waitpid(loadgen_pid, &loadgen_status, 0) == loadgen_pid);
+    ASSERT_TRUE(WIFEXITED(loadgen_status));
+    ASSERT_TRUE(WEXITSTATUS(loadgen_status) == 0);
+
+    ASSERT_TRUE(stop_broker_process(broker_pid, &broker_status) == 0);
+    ASSERT_TRUE(WIFEXITED(broker_status));
+    ASSERT_TRUE(WEXITSTATUS(broker_status) == 0);
+    ASSERT_TRUE(parse_broker_final_metrics(broker_log_path, &broker_metrics) == 0);
+    ASSERT_TRUE(broker_metrics.published >= 2500u);
+    ASSERT_TRUE(broker_metrics.delivered >= 2100u);
+    ASSERT_TRUE(broker_metrics.transport_errors >= 30u);
+
+    unlink(socket_path);
+    unlink(broker_log_path);
+    unlink(loadgen_log_path);
+    return 0;
+}
+
 static int test_context_validation_edges(void)
 {
     cd_context_t *context;
@@ -2984,8 +3351,11 @@ int main(void)
     RUN_TEST(test_ipc_socket_transport_forked_two_process_roundtrip);
     RUN_TEST(test_broker_process_routes_between_clients);
     RUN_TEST(test_broker_reconnect_without_restart);
+    RUN_TEST(test_broker_diagnostics_request_endpoint);
     RUN_TEST(test_broker_restart_with_client_reconnect);
     RUN_TEST(test_loadgen_soak_against_broker);
+    RUN_TEST(test_broker_malformed_frame_burst_under_load);
+    RUN_TEST(test_broker_disconnect_storm_under_load);
     RUN_TEST(test_ipc_codec_roundtrip);
     RUN_TEST(test_ipc_codec_validation_guards);
     RUN_TEST(test_queue_and_argument_edges);
