@@ -45,6 +45,7 @@ This sample demonstrates deterministic embedded dispatch with the flow:
 - Generic transport contract: `include/conduit/transport.h`
 - In-process hub transport: `include/conduit/transport_inproc.h`
 - IPC frame codec (serialization guards): `include/conduit/transport_ipc.h`
+- IPC socket transport adapter: `include/conduit/transport_ipc_socket.h`
 - Bus supports transport attach/detach + polling in `cd_bus_pump`.
 
 ## Direction Summary

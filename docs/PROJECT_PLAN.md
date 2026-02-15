@@ -89,6 +89,10 @@ Status:
 - IPC frame codec implemented with version/size guards:
   - `include/conduit/transport_ipc.h`
   - `src/transport_ipc.c`
+- IPC socket adapter implemented with framed stream I/O:
+  - `include/conduit/transport_ipc_socket.h`
+  - `src/transport_ipc_socket.c`
+- Socketpair integration tests added for event and request/reply exchange.
 
 ## Phase 5: Broker/Bridge App
 

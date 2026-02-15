@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #define ASSERT_TRUE(condition)                                                      \
     do {                                                                            \
@@ -70,6 +72,14 @@ typedef struct request_replier_state {
     size_t reply_payload_size;
     uint16_t reply_flags;
 } request_replier_state_t;
+
+static void close_fd_if_open(int *fd)
+{
+    if (fd != NULL && *fd >= 0) {
+        close(*fd);
+        *fd = -1;
+    }
+}
 
 static void test_free_adapter(void *user_data, void *ptr)
 {
@@ -1325,6 +1335,300 @@ static int test_inproc_transport_request_reply_between_buses(void)
     return 0;
 }
 
+static int test_ipc_socket_transport_event_routing_between_buses(void)
+{
+    cd_context_t *context;
+    cd_bus_t *bus_a;
+    cd_bus_t *bus_b;
+    cd_bus_config_t bus_config;
+    cd_transport_t transport_a;
+    cd_transport_t transport_b;
+    cd_subscription_desc_t sub;
+    cd_publish_params_t publish;
+    capture_state_t capture;
+    handler_state_t handler;
+    size_t processed;
+    int sockets[2];
+
+    context = NULL;
+    bus_a = NULL;
+    bus_b = NULL;
+    sockets[0] = -1;
+    sockets[1] = -1;
+    memset(&transport_a, 0, sizeof(transport_a));
+    memset(&transport_b, 0, sizeof(transport_b));
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 32u;
+    bus_config.max_subscriptions = 16u;
+    bus_config.max_inflight_requests = 16u;
+    bus_config.max_transports = 1u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_b), CD_STATUS_OK);
+
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, sockets[0], NULL, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, sockets[1], NULL, &transport_b), CD_STATUS_OK);
+    sockets[0] = -1;
+    sockets[1] = -1;
+
+    ASSERT_STATUS(cd_bus_attach_transport(bus_a, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_attach_transport(bus_b, &transport_b), CD_STATUS_OK);
+
+    memset(&capture, 0, sizeof(capture));
+    memset(&handler, 0, sizeof(handler));
+    handler.capture = &capture;
+    handler.marker = 77;
+    handler.return_status = CD_STATUS_OK;
+
+    memset(&sub, 0, sizeof(sub));
+    sub.endpoint = 19u;
+    sub.topic = 1700u;
+    sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_EVENT);
+    sub.handler = generic_handler;
+    sub.user_data = &handler;
+    ASSERT_STATUS(cd_subscribe(bus_b, &sub, NULL), CD_STATUS_OK);
+
+    memset(&publish, 0, sizeof(publish));
+    publish.source_endpoint = 2u;
+    publish.topic = 1700u;
+    publish.schema_id = 42u;
+    publish.schema_version = 1u;
+    publish.flags = 0u;
+    publish.payload = "sock-xy";
+    publish.payload_size = strlen("sock-xy");
+    ASSERT_STATUS(cd_publish(bus_a, &publish, NULL), CD_STATUS_OK);
+
+    processed = 0u;
+    ASSERT_STATUS(cd_bus_pump(bus_b, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(processed == 1u);
+    ASSERT_TRUE(capture.count == 1);
+    ASSERT_TRUE(capture.markers[0] == 77);
+    ASSERT_TRUE(capture.kinds[0] == CD_MESSAGE_EVENT);
+    ASSERT_TRUE(strcmp(capture.payloads[0], "sock-xy") == 0);
+
+    ASSERT_STATUS(cd_bus_pump(bus_a, 0u, &processed), CD_STATUS_OK);
+
+    cd_ipc_socket_transport_close(&transport_a);
+    cd_ipc_socket_transport_close(&transport_b);
+    cd_bus_destroy(bus_a);
+    cd_bus_destroy(bus_b);
+    cd_context_shutdown(context);
+    return 0;
+}
+
+static int test_ipc_socket_transport_request_reply_between_buses(void)
+{
+    cd_context_t *context;
+    cd_bus_t *bus_a;
+    cd_bus_t *bus_b;
+    cd_bus_config_t bus_config;
+    cd_transport_t transport_a;
+    cd_transport_t transport_b;
+    cd_subscription_desc_t sub;
+    request_replier_state_t replier_state;
+    cd_request_params_t request;
+    cd_request_token_t token;
+    size_t processed;
+    int ready;
+    cd_reply_t reply;
+    int sockets[2];
+
+    context = NULL;
+    bus_a = NULL;
+    bus_b = NULL;
+    sockets[0] = -1;
+    sockets[1] = -1;
+    memset(&transport_a, 0, sizeof(transport_a));
+    memset(&transport_b, 0, sizeof(transport_b));
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 32u;
+    bus_config.max_subscriptions = 16u;
+    bus_config.max_inflight_requests = 16u;
+    bus_config.max_transports = 1u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_b), CD_STATUS_OK);
+
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, sockets[0], NULL, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, sockets[1], NULL, &transport_b), CD_STATUS_OK);
+    sockets[0] = -1;
+    sockets[1] = -1;
+
+    ASSERT_STATUS(cd_bus_attach_transport(bus_a, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_attach_transport(bus_b, &transport_b), CD_STATUS_OK);
+
+    memset(&replier_state, 0, sizeof(replier_state));
+    replier_state.bus = bus_b;
+    replier_state.reply_payload = "socket-ok";
+    replier_state.reply_payload_size = strlen("socket-ok");
+    replier_state.reply_flags = 0u;
+
+    memset(&sub, 0, sizeof(sub));
+    sub.endpoint = 55u;
+    sub.topic = 1908u;
+    sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_REQUEST);
+    sub.handler = request_replier_handler;
+    sub.user_data = &replier_state;
+    ASSERT_STATUS(cd_subscribe(bus_b, &sub, NULL), CD_STATUS_OK);
+
+    memset(&request, 0, sizeof(request));
+    request.source_endpoint = 6u;
+    request.target_endpoint = 55u;
+    request.topic = 1908u;
+    request.schema_id = 77u;
+    request.schema_version = 1u;
+    request.flags = 0u;
+    request.timeout_ns = 1000000000ull;
+    request.payload = "socket-ask";
+    request.payload_size = strlen("socket-ask");
+
+    token = 0u;
+    ASSERT_STATUS(cd_request_async(bus_a, &request, &token), CD_STATUS_OK);
+    ASSERT_TRUE(token != 0u);
+
+    processed = 0u;
+    ASSERT_STATUS(cd_bus_pump(bus_b, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(processed == 1u);
+    ASSERT_TRUE(replier_state.request_hits == 1);
+    ASSERT_TRUE(strcmp(replier_state.last_payload, "socket-ask") == 0);
+
+    processed = 0u;
+    ASSERT_STATUS(cd_bus_pump(bus_a, 0u, &processed), CD_STATUS_OK);
+    ASSERT_TRUE(processed == 2u);
+
+    ready = 0;
+    memset(&reply, 0, sizeof(reply));
+    ASSERT_STATUS(cd_poll_reply(bus_a, token, &reply, &ready), CD_STATUS_OK);
+    ASSERT_TRUE(ready == 1);
+    ASSERT_TRUE(reply.payload != NULL);
+    ASSERT_TRUE(reply.payload_size == replier_state.reply_payload_size);
+    ASSERT_TRUE(strncmp((const char *)reply.payload, "socket-ok", reply.payload_size) == 0);
+    cd_reply_dispose(bus_a, &reply);
+
+    cd_ipc_socket_transport_close(&transport_a);
+    cd_ipc_socket_transport_close(&transport_b);
+    cd_bus_destroy(bus_a);
+    cd_bus_destroy(bus_b);
+    cd_context_shutdown(context);
+    return 0;
+}
+
+static int test_ipc_socket_transport_protocol_mismatch_path(void)
+{
+    cd_context_t *context;
+    cd_bus_t *bus;
+    cd_bus_config_t bus_config;
+    cd_transport_t transport;
+    size_t processed;
+    int sockets[2];
+    uint8_t malformed_frame[CD_IPC_FRAME_HEADER_SIZE];
+
+    context = NULL;
+    bus = NULL;
+    sockets[0] = -1;
+    sockets[1] = -1;
+    memset(&transport, 0, sizeof(transport));
+    memset(malformed_frame, 0, sizeof(malformed_frame));
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 32u;
+    bus_config.max_subscriptions = 16u;
+    bus_config.max_inflight_requests = 16u;
+    bus_config.max_transports = 1u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus), CD_STATUS_OK);
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, sockets[0], NULL, &transport), CD_STATUS_OK);
+    sockets[0] = -1;
+
+    ASSERT_STATUS(cd_bus_attach_transport(bus, &transport), CD_STATUS_OK);
+    ASSERT_TRUE(send(sockets[1], malformed_frame, sizeof(malformed_frame), 0) == (ssize_t)sizeof(malformed_frame));
+
+    processed = 999u;
+    ASSERT_STATUS(cd_bus_pump(bus, 0u, &processed), CD_STATUS_SCHEMA_MISMATCH);
+    ASSERT_TRUE(processed == 0u);
+
+    close_fd_if_open(&sockets[1]);
+    cd_ipc_socket_transport_close(&transport);
+    cd_bus_destroy(bus);
+    cd_context_shutdown(context);
+    return 0;
+}
+
+static int test_ipc_socket_transport_disconnect_paths(void)
+{
+    cd_context_t *context;
+    cd_bus_t *bus;
+    cd_bus_config_t bus_config;
+    cd_transport_t transport;
+    size_t processed;
+    int sockets[2];
+    uint8_t truncated[13];
+    cd_envelope_t message;
+
+    context = NULL;
+    bus = NULL;
+    sockets[0] = -1;
+    sockets[1] = -1;
+    memset(&transport, 0, sizeof(transport));
+    memset(truncated, 0xA5, sizeof(truncated));
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 32u;
+    bus_config.max_subscriptions = 16u;
+    bus_config.max_inflight_requests = 16u;
+    bus_config.max_transports = 1u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus), CD_STATUS_OK);
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, sockets[0], NULL, &transport), CD_STATUS_OK);
+    sockets[0] = -1;
+    ASSERT_STATUS(cd_bus_attach_transport(bus, &transport), CD_STATUS_OK);
+
+    ASSERT_TRUE(send(sockets[1], truncated, sizeof(truncated), 0) == (ssize_t)sizeof(truncated));
+    close_fd_if_open(&sockets[1]);
+    processed = 123u;
+    ASSERT_STATUS(cd_bus_pump(bus, 0u, &processed), CD_STATUS_TRANSPORT_UNAVAILABLE);
+    ASSERT_TRUE(processed == 0u);
+
+    cd_ipc_socket_transport_close(&transport);
+    cd_bus_destroy(bus);
+    cd_context_shutdown(context);
+
+    context = NULL;
+    sockets[0] = -1;
+    sockets[1] = -1;
+    memset(&transport, 0, sizeof(transport));
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, sockets[0], NULL, &transport), CD_STATUS_OK);
+    sockets[0] = -1;
+    close_fd_if_open(&sockets[1]);
+
+    memset(&message, 0, sizeof(message));
+    message.message_id = 1u;
+    message.kind = CD_MESSAGE_EVENT;
+    message.topic = 500u;
+    message.source_endpoint = 7u;
+    message.flags = CD_MESSAGE_FLAG_NONE;
+    message.payload = "x";
+    message.payload_size = 1u;
+    ASSERT_STATUS(transport.send(transport.impl, &message), CD_STATUS_TRANSPORT_UNAVAILABLE);
+
+    cd_ipc_socket_transport_close(&transport);
+    cd_context_shutdown(context);
+    return 0;
+}
+
 static int test_context_validation_edges(void)
 {
     cd_context_t *context;
@@ -1368,6 +1672,10 @@ int main(void)
     RUN_TEST(test_transport_attach_detach_validation);
     RUN_TEST(test_inproc_transport_event_routing_between_buses);
     RUN_TEST(test_inproc_transport_request_reply_between_buses);
+    RUN_TEST(test_ipc_socket_transport_event_routing_between_buses);
+    RUN_TEST(test_ipc_socket_transport_request_reply_between_buses);
+    RUN_TEST(test_ipc_socket_transport_protocol_mismatch_path);
+    RUN_TEST(test_ipc_socket_transport_disconnect_paths);
     RUN_TEST(test_ipc_codec_roundtrip);
     RUN_TEST(test_ipc_codec_validation_guards);
     RUN_TEST(test_queue_and_argument_edges);

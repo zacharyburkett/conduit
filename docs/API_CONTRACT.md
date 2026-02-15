@@ -57,6 +57,9 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - `cd_bus_pump` polls attached transports before processing the local queue snapshot.
 - Replies from transport are captured through normal inflight correlation.
 - Timed-out requests are dropped if later encountered in the dispatch queue.
+- IPC socket transport uses framed envelopes over stream sockets.
+- Socket disconnect/read-write failures map to `CD_STATUS_TRANSPORT_UNAVAILABLE`.
+- IPC frame/protocol violations map to `CD_STATUS_SCHEMA_MISMATCH`.
 
 ## IPC Frame Codec Semantics
 
@@ -69,4 +72,5 @@ This document freezes the initial API behavior and ownership rules for the scaff
 
 ## Phase Boundaries
 
-- Transport adapters are reserved for later milestones.
+- Socket transport framing is available; broker/process supervision is still a
+  later milestone.
