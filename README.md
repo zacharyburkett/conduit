@@ -69,6 +69,8 @@ topic 3501 901
 topic 0x00020001 20 21
 ```
 
+Test coverage includes broker reconnect and broker restart recovery scenarios.
+
 ## Transport Layer (Phase 4 Start)
 
 - Generic transport contract: `include/conduit/transport.h`

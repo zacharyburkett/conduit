@@ -84,6 +84,7 @@ This document freezes the initial API behavior and ownership rules for the scaff
   transport error counts.
 - Route file line format is:
   - `topic <topic_id> <endpoint_id> [endpoint_id...]`
+- Integration coverage includes reconnect and broker restart recovery paths.
 
 ## Phase Boundaries
 

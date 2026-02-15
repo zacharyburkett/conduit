@@ -120,6 +120,8 @@ Status:
   - test auto-skips when the runtime disallows Unix socket path bind.
 - Reconnect integration test added:
   - `tests/test_main.c` (`test_broker_reconnect_without_restart`)
+- Broker restart + client reconnect integration test added:
+  - `tests/test_main.c` (`test_broker_restart_with_client_reconnect`)
 
 ## Phase 6: Hardening and Tooling
 
