@@ -4,6 +4,7 @@ project(conduit VERSION 0.1.0 LANGUAGES C)
 include(GNUInstallDirs)
 
 option(CONDUIT_BUILD_TESTS "Build conduit tests" ON)
+option(CONDUIT_BUILD_SAMPLES "Build conduit sample apps" ON)
 
 add_library(conduit
     src/core.c
@@ -46,4 +47,13 @@ if(CONDUIT_BUILD_TESTS)
     add_executable(conduit_tests tests/test_main.c)
     target_link_libraries(conduit_tests PRIVATE conduit)
     add_test(NAME conduit_tests COMMAND conduit_tests)
+endif()
+
+if(CONDUIT_BUILD_SAMPLES)
+    add_executable(conduit_embedded_sample apps/embedded_sample/main.c)
+    target_link_libraries(conduit_embedded_sample PRIVATE conduit)
+
+    if(CONDUIT_BUILD_TESTS)
+        add_test(NAME conduit_embedded_sample_smoke COMMAND conduit_embedded_sample)
+    endif()
 endif()

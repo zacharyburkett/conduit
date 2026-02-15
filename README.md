@@ -12,6 +12,7 @@ It is designed to support two modes without changing module-level message logic:
 - Architecture: `docs/ARCHITECTURE.md`
 - Delivery plan: `docs/PROJECT_PLAN.md`
 - API contract: `docs/API_CONTRACT.md`
+- Topic catalog: `docs/TOPIC_CATALOG.md`
 
 ## Build
 
@@ -25,6 +26,19 @@ cmake --build build
 ```sh
 ctest --test-dir build --output-on-failure
 ```
+
+## Embedded Sample
+
+Build includes the sample app by default (`CONDUIT_BUILD_SAMPLES=ON`):
+
+```sh
+./build/conduit_embedded_sample
+```
+
+This sample demonstrates deterministic embedded dispatch with the flow:
+- `frame.begin`
+- `map.generated`
+- `entity.spawn.request` (request/reply)
 
 ## Direction Summary
 

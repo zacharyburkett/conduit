@@ -62,6 +62,11 @@ Acceptance criteria:
 - Sample app demonstrates deterministic frame dispatch.
 - Topic catalog and naming conventions documented.
 
+Status:
+- Implemented in current branch via:
+  - `apps/embedded_sample/main.c`
+  - `docs/TOPIC_CATALOG.md`
+
 ## Phase 4: IPC Transport Adapter
 
 Deliverables:
