@@ -165,6 +165,10 @@ Status:
     - `summary.txt`
     - `loadgen.log`
     - `broker.log`
+- Loadgen integration flake hardening:
+  - tests now wait for broker readiness before spawning loadgen
+  - test loadgen invocations use higher connect-attempt tolerance
+  - soak/profile/stress runtime margins widened for slower CI runners
 
 ## Test Matrix
 

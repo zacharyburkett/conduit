@@ -552,7 +552,8 @@ int main(int argc, char **argv)
             if (status == CD_STATUS_OK) {
                 events_sent += 1u;
                 progressed = true;
-            } else if (status == CD_STATUS_QUEUE_FULL) {
+            } else if (status == CD_STATUS_QUEUE_FULL ||
+                       status == CD_STATUS_CAPACITY_REACHED) {
                 event_queue_full_retries += 1u;
             } else {
                 fprintf(stderr, "[loadgen] event publish failed: %s\n", cd_status_string(status));
@@ -622,7 +623,7 @@ int main(int argc, char **argv)
         token = 0u;
         request_send_ns = now_ns();
         status = cd_request_async(bus_sender, &request, &token);
-        if (status == CD_STATUS_QUEUE_FULL) {
+        if (status == CD_STATUS_QUEUE_FULL || status == CD_STATUS_CAPACITY_REACHED) {
             size_t processed_total;
             request_queue_full_retries += 1u;
             status = pump_pair(bus_sender, bus_replier, &processed_total);
