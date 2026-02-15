@@ -5,6 +5,7 @@ This document defines current thread-safety guarantees for `conduit`.
 ## Current Guarantee
 
 - Bus internals are protected by an internal recursive mutex.
+- In-process transport hub queues are protected by an internal mutex.
 - The following APIs are thread-safe for concurrent calls on the same bus:
   - `cd_publish`
   - `cd_send_command`

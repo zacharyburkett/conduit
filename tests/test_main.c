@@ -7,6 +7,8 @@
 #include <string.h>
 #include <signal.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -133,6 +135,25 @@ typedef struct publish_thread_args {
     int messages;
     int failures;
 } publish_thread_args_t;
+
+typedef struct request_echo_replier_state {
+    cd_bus_t *bus;
+    int request_hits;
+} request_echo_replier_state_t;
+
+typedef struct request_thread_args {
+    cd_bus_t *request_bus;
+    int thread_index;
+    int request_count;
+    int failures;
+} request_thread_args_t;
+
+typedef struct pump_thread_args {
+    cd_bus_t *bus_a;
+    cd_bus_t *bus_b;
+    atomic_int stop;
+    int failures;
+} pump_thread_args_t;
 
 static void close_fd_if_open(int *fd)
 {
@@ -857,6 +878,157 @@ static void *publish_thread_main(void *arg)
     return NULL;
 }
 
+static cd_status_t request_echo_replier_handler(void *user_data, const cd_envelope_t *message)
+{
+    request_echo_replier_state_t *state;
+    cd_reply_params_t reply_params;
+    uint64_t reply_value;
+
+    state = (request_echo_replier_state_t *)user_data;
+    if (state == NULL || state->bus == NULL || message == NULL ||
+        message->kind != CD_MESSAGE_REQUEST ||
+        message->payload == NULL || message->payload_size < sizeof(reply_value)) {
+        return CD_STATUS_INVALID_ARGUMENT;
+    }
+
+    memcpy(&reply_value, message->payload, sizeof(reply_value));
+    state->request_hits += 1;
+
+    memset(&reply_params, 0, sizeof(reply_params));
+    reply_params.source_endpoint = message->target_endpoint;
+    reply_params.target_endpoint = message->source_endpoint;
+    reply_params.correlation_id = message->message_id;
+    reply_params.topic = message->topic;
+    reply_params.schema_id = 0x00C00001u;
+    reply_params.schema_version = 1u;
+    reply_params.flags = 0u;
+    reply_params.payload = &reply_value;
+    reply_params.payload_size = sizeof(reply_value);
+    return cd_send_reply(state->bus, &reply_params, NULL);
+}
+
+static void *pump_pair_thread_main(void *arg)
+{
+    pump_thread_args_t *thread_args;
+    int drain_i;
+
+    thread_args = (pump_thread_args_t *)arg;
+    if (thread_args == NULL || thread_args->bus_a == NULL || thread_args->bus_b == NULL) {
+        return NULL;
+    }
+
+    while (atomic_load_explicit(&thread_args->stop, memory_order_acquire) == 0) {
+        if (cd_bus_pump(thread_args->bus_b, 0u, NULL) != CD_STATUS_OK ||
+            cd_bus_pump(thread_args->bus_a, 0u, NULL) != CD_STATUS_OK) {
+            thread_args->failures += 1;
+            return NULL;
+        }
+        usleep(100u);
+    }
+
+    for (drain_i = 0; drain_i < 200; ++drain_i) {
+        if (cd_bus_pump(thread_args->bus_b, 0u, NULL) != CD_STATUS_OK ||
+            cd_bus_pump(thread_args->bus_a, 0u, NULL) != CD_STATUS_OK) {
+            thread_args->failures += 1;
+            return NULL;
+        }
+        usleep(50u);
+    }
+
+    return NULL;
+}
+
+static void *request_thread_main(void *arg)
+{
+    request_thread_args_t *thread_args;
+    int i;
+
+    thread_args = (request_thread_args_t *)arg;
+    if (thread_args == NULL || thread_args->request_bus == NULL || thread_args->request_count <= 0) {
+        return NULL;
+    }
+
+    for (i = 0; i < thread_args->request_count; ++i) {
+        cd_request_params_t request;
+        cd_request_token_t token;
+        uint64_t payload_value;
+        int send_attempts;
+
+        payload_value = ((uint64_t)(unsigned)thread_args->thread_index << 32) | (uint64_t)(unsigned)i;
+
+        memset(&request, 0, sizeof(request));
+        request.source_endpoint = (cd_endpoint_id_t)(700u + (unsigned)thread_args->thread_index);
+        request.target_endpoint = 901u;
+        request.topic = 0x00C10001u;
+        request.schema_id = 0x00C10001u;
+        request.schema_version = 1u;
+        request.flags = 0u;
+        request.timeout_ns = 30000000000ull;
+        request.payload = &payload_value;
+        request.payload_size = sizeof(payload_value);
+
+        token = 0u;
+        send_attempts = 0;
+        while (true) {
+            cd_status_t send_status;
+
+            send_status = cd_request_async(thread_args->request_bus, &request, &token);
+            if (send_status == CD_STATUS_OK && token != 0u) {
+                break;
+            }
+            if (send_status == CD_STATUS_QUEUE_FULL || send_status == CD_STATUS_CAPACITY_REACHED) {
+                send_attempts += 1;
+                if (send_attempts > 20000) {
+                    thread_args->failures += 1;
+                    return NULL;
+                }
+                usleep(200u);
+                continue;
+            }
+            thread_args->failures += 1;
+            return NULL;
+        }
+
+        while (true) {
+            cd_reply_t reply;
+            int ready;
+            cd_status_t poll_status;
+            uint64_t reply_value;
+
+            memset(&reply, 0, sizeof(reply));
+            ready = 0;
+            poll_status = cd_poll_reply(thread_args->request_bus, token, &reply, &ready);
+            if (poll_status == CD_STATUS_OK && ready == 0) {
+                usleep(5000u);
+                continue;
+            }
+            if (poll_status == CD_STATUS_OK && ready == 1) {
+                if (reply.payload == NULL || reply.payload_size < sizeof(reply_value)) {
+                    thread_args->failures += 1;
+                    return NULL;
+                }
+                memcpy(&reply_value, reply.payload, sizeof(reply_value));
+                cd_reply_dispose(thread_args->request_bus, &reply);
+                if (reply_value != payload_value) {
+                    thread_args->failures += 1;
+                    return NULL;
+                }
+                poll_status = cd_poll_reply(thread_args->request_bus, token, NULL, NULL);
+                if (poll_status != CD_STATUS_NOT_FOUND) {
+                    thread_args->failures += 1;
+                    return NULL;
+                }
+                break;
+            }
+
+            thread_args->failures += 1;
+            return NULL;
+        }
+    }
+
+    return NULL;
+}
+
 static cd_status_t request_replier_handler(void *user_data, const cd_envelope_t *message)
 {
     request_replier_state_t *state;
@@ -1472,6 +1644,102 @@ static int test_threadsafe_multi_producer_publish(void)
     ASSERT_TRUE(capture.count == (THREAD_COUNT * MESSAGES_PER_THREAD));
 
     teardown_runtime(&runtime);
+    return 0;
+}
+
+static int test_threadsafe_concurrent_request_reply_ownership(void)
+{
+    enum {
+        REQUEST_THREAD_COUNT = 4,
+        REQUESTS_PER_THREAD = 200
+    };
+
+    cd_context_t *context;
+    cd_bus_t *bus_a;
+    cd_bus_t *bus_b;
+    cd_bus_config_t bus_config;
+    cd_inproc_hub_t *hub;
+    cd_inproc_hub_config_t hub_config;
+    cd_transport_t transport_a;
+    cd_transport_t transport_b;
+    cd_subscription_desc_t request_sub;
+    request_echo_replier_state_t replier_state;
+    pump_thread_args_t pump_args;
+    pthread_t pump_thread;
+    request_thread_args_t request_args[REQUEST_THREAD_COUNT];
+    pthread_t request_threads[REQUEST_THREAD_COUNT];
+    int i;
+
+    context = NULL;
+    bus_a = NULL;
+    bus_b = NULL;
+    hub = NULL;
+    memset(&transport_a, 0, sizeof(transport_a));
+    memset(&transport_b, 0, sizeof(transport_b));
+    memset(&replier_state, 0, sizeof(replier_state));
+    memset(&pump_args, 0, sizeof(pump_args));
+    memset(request_args, 0, sizeof(request_args));
+    memset(request_threads, 0, sizeof(request_threads));
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 8192u;
+    bus_config.max_subscriptions = 16u;
+    bus_config.max_inflight_requests = 4096u;
+    bus_config.max_transports = 2u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus_b), CD_STATUS_OK);
+
+    memset(&hub_config, 0, sizeof(hub_config));
+    hub_config.max_peers = 2u;
+    hub_config.max_queued_messages_per_peer = 8192u;
+    ASSERT_STATUS(cd_inproc_hub_init(context, &hub_config, &hub), CD_STATUS_OK);
+    ASSERT_STATUS(cd_inproc_hub_create_transport(hub, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_inproc_hub_create_transport(hub, &transport_b), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_attach_transport(bus_a, &transport_a), CD_STATUS_OK);
+    ASSERT_STATUS(cd_bus_attach_transport(bus_b, &transport_b), CD_STATUS_OK);
+
+    replier_state.bus = bus_b;
+    memset(&request_sub, 0, sizeof(request_sub));
+    request_sub.endpoint = 901u;
+    request_sub.topic = 0x00C10001u;
+    request_sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_REQUEST);
+    request_sub.handler = request_echo_replier_handler;
+    request_sub.user_data = &replier_state;
+    ASSERT_STATUS(cd_subscribe(bus_b, &request_sub, NULL), CD_STATUS_OK);
+
+    pump_args.bus_a = bus_a;
+    pump_args.bus_b = bus_b;
+    atomic_init(&pump_args.stop, 0);
+    pump_args.failures = 0;
+    ASSERT_TRUE(pthread_create(&pump_thread, NULL, pump_pair_thread_main, &pump_args) == 0);
+
+    for (i = 0; i < REQUEST_THREAD_COUNT; ++i) {
+        request_args[i].request_bus = bus_a;
+        request_args[i].thread_index = i;
+        request_args[i].request_count = REQUESTS_PER_THREAD;
+        request_args[i].failures = 0;
+        ASSERT_TRUE(pthread_create(&request_threads[i], NULL, request_thread_main, &request_args[i]) == 0);
+    }
+
+    for (i = 0; i < REQUEST_THREAD_COUNT; ++i) {
+        ASSERT_TRUE(pthread_join(request_threads[i], NULL) == 0);
+        ASSERT_TRUE(request_args[i].failures == 0);
+    }
+
+    atomic_store_explicit(&pump_args.stop, 1, memory_order_release);
+    ASSERT_TRUE(pthread_join(pump_thread, NULL) == 0);
+    ASSERT_TRUE(pump_args.failures == 0);
+
+    ASSERT_TRUE(replier_state.request_hits == (REQUEST_THREAD_COUNT * REQUESTS_PER_THREAD));
+
+    cd_inproc_transport_close(&transport_a);
+    cd_inproc_transport_close(&transport_b);
+    cd_inproc_hub_shutdown(hub);
+    cd_bus_destroy(bus_a);
+    cd_bus_destroy(bus_b);
+    cd_context_shutdown(context);
     return 0;
 }
 
@@ -3899,6 +4167,7 @@ int main(void)
     RUN_TEST(test_pump_returns_first_callback_error);
     RUN_TEST(test_trace_hook_reports_core_events);
     RUN_TEST(test_threadsafe_multi_producer_publish);
+    RUN_TEST(test_threadsafe_concurrent_request_reply_ownership);
     RUN_TEST(test_request_reply_roundtrip_and_dispose);
     RUN_TEST(test_request_timeout_with_fake_clock);
     RUN_TEST(test_request_inflight_capacity_and_validation);

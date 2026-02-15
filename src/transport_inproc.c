@@ -20,6 +20,7 @@ typedef struct cd_inproc_peer {
 
 struct cd_inproc_hub {
     cd_context_t *context;
+    cd_mutex_t *lock;
     cd_inproc_peer_t *peers;
     size_t peer_capacity;
     size_t per_peer_queue_capacity;
@@ -29,6 +30,20 @@ enum {
     CD_INPROC_DEFAULT_MAX_PEERS = 8,
     CD_INPROC_DEFAULT_MAX_QUEUED_PER_PEER = 256
 };
+
+static void inproc_hub_lock(cd_inproc_hub_t *hub)
+{
+    if (hub != NULL && hub->lock != NULL) {
+        (void)cd_mutex_lock(hub->lock);
+    }
+}
+
+static void inproc_hub_unlock(cd_inproc_hub_t *hub)
+{
+    if (hub != NULL && hub->lock != NULL) {
+        (void)cd_mutex_unlock(hub->lock);
+    }
+}
 
 static bool size_mul_overflow(size_t a, size_t b, size_t *out_result)
 {
@@ -113,6 +128,11 @@ static cd_status_t inproc_send(void *impl, const cd_envelope_t *message)
     }
 
     hub = sender->hub;
+    if (hub == NULL) {
+        return CD_STATUS_TRANSPORT_UNAVAILABLE;
+    }
+
+    inproc_hub_lock(hub);
     status = CD_STATUS_OK;
     for (i = 0; i < hub->peer_capacity; ++i) {
         cd_inproc_peer_t *peer;
@@ -128,6 +148,7 @@ static cd_status_t inproc_send(void *impl, const cd_envelope_t *message)
             status = enqueue_status;
         }
     }
+    inproc_hub_unlock(hub);
 
     return status;
 }
@@ -141,6 +162,7 @@ static cd_status_t inproc_poll(
 )
 {
     cd_inproc_peer_t *peer;
+    cd_inproc_hub_t *hub;
     size_t limit;
     size_t processed;
 
@@ -152,6 +174,12 @@ static cd_status_t inproc_poll(
     if (peer == NULL || !peer->in_use || receive_fn == NULL) {
         return CD_STATUS_INVALID_ARGUMENT;
     }
+    hub = peer->hub;
+    if (hub == NULL) {
+        return CD_STATUS_TRANSPORT_UNAVAILABLE;
+    }
+
+    inproc_hub_lock(hub);
 
     limit = max_messages;
     if (limit == 0u || limit > peer->queue_count) {
@@ -175,6 +203,7 @@ static cd_status_t inproc_poll(
             if (out_polled_count != NULL) {
                 *out_polled_count = processed;
             }
+            inproc_hub_unlock(hub);
             return receive_status;
         }
     }
@@ -182,6 +211,7 @@ static cd_status_t inproc_poll(
     if (out_polled_count != NULL) {
         *out_polled_count = processed;
     }
+    inproc_hub_unlock(hub);
     return CD_STATUS_OK;
 }
 
@@ -200,14 +230,18 @@ static cd_status_t inproc_flush(void *impl)
 static void inproc_shutdown(void *impl)
 {
     cd_inproc_peer_t *peer;
+    cd_inproc_hub_t *hub;
 
     peer = (cd_inproc_peer_t *)impl;
     if (peer == NULL || !peer->in_use) {
         return;
     }
 
+    hub = peer->hub;
+    inproc_hub_lock(hub);
     inproc_peer_reset_queue(peer);
     peer->in_use = false;
+    inproc_hub_unlock(hub);
 }
 
 cd_status_t cd_inproc_hub_init(
@@ -250,8 +284,13 @@ cd_status_t cd_inproc_hub_init(
     hub->context = context;
     hub->peer_capacity = max_peers;
     hub->per_peer_queue_capacity = max_queued_per_peer;
+    if (cd_mutex_create(context, &hub->lock) != CD_STATUS_OK) {
+        cd_context_free(context, hub);
+        return CD_STATUS_ALLOCATION_FAILED;
+    }
     hub->peers = (cd_inproc_peer_t *)cd_context_alloc(context, peers_alloc_size);
     if (hub->peers == NULL) {
+        cd_mutex_destroy(context, hub->lock);
         cd_context_free(context, hub);
         return CD_STATUS_ALLOCATION_FAILED;
     }
@@ -275,6 +314,7 @@ void cd_inproc_hub_shutdown(cd_inproc_hub_t *hub)
         }
     }
 
+    cd_mutex_destroy(hub->context, hub->lock);
     cd_context_free(hub->context, hub->peers);
     cd_context_free(hub->context, hub);
 }
@@ -297,6 +337,7 @@ cd_status_t cd_inproc_hub_create_transport(cd_inproc_hub_t *hub, cd_transport_t 
         return CD_STATUS_INVALID_ARGUMENT;
     }
 
+    inproc_hub_lock(hub);
     for (i = 0; i < hub->peer_capacity; ++i) {
         cd_inproc_peer_t *peer;
 
@@ -313,6 +354,7 @@ cd_status_t cd_inproc_hub_create_transport(cd_inproc_hub_t *hub, cd_transport_t 
         peer->queue = (cd_inproc_message_t *)cd_context_alloc(hub->context, queue_alloc_size);
         if (peer->queue == NULL) {
             memset(peer, 0, sizeof(*peer));
+            inproc_hub_unlock(hub);
             return CD_STATUS_ALLOCATION_FAILED;
         }
         memset(peer->queue, 0, queue_alloc_size);
@@ -323,9 +365,11 @@ cd_status_t cd_inproc_hub_create_transport(cd_inproc_hub_t *hub, cd_transport_t 
         out_transport->poll = inproc_poll;
         out_transport->flush = inproc_flush;
         out_transport->shutdown = inproc_shutdown;
+        inproc_hub_unlock(hub);
         return CD_STATUS_OK;
     }
 
+    inproc_hub_unlock(hub);
     return CD_STATUS_CAPACITY_REACHED;
 }
 
