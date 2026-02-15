@@ -93,6 +93,8 @@ Status:
   - `include/conduit/transport_ipc_socket.h`
   - `src/transport_ipc_socket.c`
 - Socketpair integration tests added for event and request/reply exchange.
+- Forked two-process integration test added for cross-process event +
+  request/reply exchange over IPC socket transport.
 
 ## Phase 5: Broker/Bridge App
 

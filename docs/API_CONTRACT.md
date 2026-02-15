@@ -60,6 +60,8 @@ This document freezes the initial API behavior and ownership rules for the scaff
 - IPC socket transport uses framed envelopes over stream sockets.
 - Socket disconnect/read-write failures map to `CD_STATUS_TRANSPORT_UNAVAILABLE`.
 - IPC frame/protocol violations map to `CD_STATUS_SCHEMA_MISMATCH`.
+- Cross-process event and request/reply flow is validated with a forked
+  two-process integration test.
 
 ## IPC Frame Codec Semantics
 

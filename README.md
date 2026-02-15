@@ -47,6 +47,7 @@ This sample demonstrates deterministic embedded dispatch with the flow:
 - IPC frame codec (serialization guards): `include/conduit/transport_ipc.h`
 - IPC socket transport adapter: `include/conduit/transport_ipc_socket.h`
 - Bus supports transport attach/detach + polling in `cd_bus_pump`.
+- Test suite includes a forked two-process IPC socket roundtrip scenario.
 
 ## Direction Summary
 

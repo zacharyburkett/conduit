@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define ASSERT_TRUE(condition)                                                      \
@@ -1629,6 +1630,201 @@ static int test_ipc_socket_transport_disconnect_paths(void)
     return 0;
 }
 
+static int run_ipc_socket_two_process_child(int socket_fd)
+{
+    cd_context_t *context;
+    cd_bus_t *bus;
+    cd_bus_config_t bus_config;
+    cd_transport_t transport;
+    cd_subscription_desc_t event_sub;
+    cd_subscription_desc_t request_sub;
+    capture_state_t capture;
+    handler_state_t event_handler;
+    request_replier_state_t replier_state;
+    size_t processed;
+    int i;
+
+    context = NULL;
+    bus = NULL;
+    memset(&transport, 0, sizeof(transport));
+    memset(&capture, 0, sizeof(capture));
+    memset(&event_handler, 0, sizeof(event_handler));
+    memset(&replier_state, 0, sizeof(replier_state));
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 32u;
+    bus_config.max_subscriptions = 16u;
+    bus_config.max_inflight_requests = 16u;
+    bus_config.max_transports = 1u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus), CD_STATUS_OK);
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, socket_fd, NULL, &transport), CD_STATUS_OK);
+    socket_fd = -1;
+    ASSERT_STATUS(cd_bus_attach_transport(bus, &transport), CD_STATUS_OK);
+
+    event_handler.capture = &capture;
+    event_handler.marker = 1;
+    event_handler.return_status = CD_STATUS_OK;
+
+    memset(&event_sub, 0, sizeof(event_sub));
+    event_sub.endpoint = 300u;
+    event_sub.topic = 2401u;
+    event_sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_EVENT);
+    event_sub.handler = generic_handler;
+    event_sub.user_data = &event_handler;
+    ASSERT_STATUS(cd_subscribe(bus, &event_sub, NULL), CD_STATUS_OK);
+
+    replier_state.bus = bus;
+    replier_state.reply_payload = "proc-ok";
+    replier_state.reply_payload_size = strlen("proc-ok");
+    replier_state.reply_flags = 0u;
+
+    memset(&request_sub, 0, sizeof(request_sub));
+    request_sub.endpoint = 401u;
+    request_sub.topic = 2402u;
+    request_sub.kind_mask = CD_MESSAGE_KIND_MASK(CD_MESSAGE_REQUEST);
+    request_sub.handler = request_replier_handler;
+    request_sub.user_data = &replier_state;
+    ASSERT_STATUS(cd_subscribe(bus, &request_sub, NULL), CD_STATUS_OK);
+
+    for (i = 0; i < 4000; ++i) {
+        processed = 0u;
+        ASSERT_STATUS(cd_bus_pump(bus, 0u, &processed), CD_STATUS_OK);
+        if (capture.count >= 1 && replier_state.request_hits >= 1) {
+            break;
+        }
+        usleep(1000u);
+    }
+
+    ASSERT_TRUE(capture.count == 1);
+    ASSERT_TRUE(capture.kinds[0] == CD_MESSAGE_EVENT);
+    ASSERT_TRUE(strcmp(capture.payloads[0], "proc-event") == 0);
+    ASSERT_TRUE(replier_state.request_hits == 1);
+    ASSERT_TRUE(strcmp(replier_state.last_payload, "proc-ask") == 0);
+
+    cd_ipc_socket_transport_close(&transport);
+    cd_bus_destroy(bus);
+    cd_context_shutdown(context);
+    return 0;
+}
+
+static int test_ipc_socket_transport_forked_two_process_roundtrip(void)
+{
+    cd_context_t *context;
+    cd_bus_t *bus;
+    cd_bus_config_t bus_config;
+    cd_transport_t transport;
+    cd_publish_params_t publish;
+    cd_request_params_t request;
+    cd_request_token_t token;
+    cd_reply_t reply;
+    cd_status_t pump_status;
+    cd_status_t poll_status;
+    size_t processed;
+    int ready;
+    int sockets[2];
+    pid_t child_pid;
+    int child_status;
+    int i;
+
+    context = NULL;
+    bus = NULL;
+    sockets[0] = -1;
+    sockets[1] = -1;
+    child_pid = -1;
+    child_status = 0;
+    token = 0u;
+    ready = 0;
+    pump_status = CD_STATUS_OK;
+    poll_status = CD_STATUS_OK;
+    memset(&transport, 0, sizeof(transport));
+    memset(&reply, 0, sizeof(reply));
+
+    ASSERT_STATUS(cd_context_init(&context, NULL), CD_STATUS_OK);
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    child_pid = fork();
+    ASSERT_TRUE(child_pid >= 0);
+    if (child_pid == 0) {
+        int child_result;
+
+        close_fd_if_open(&sockets[0]);
+        child_result = run_ipc_socket_two_process_child(sockets[1]);
+        close_fd_if_open(&sockets[1]);
+        _exit(child_result == 0 ? 0 : 1);
+    }
+
+    close_fd_if_open(&sockets[1]);
+
+    memset(&bus_config, 0, sizeof(bus_config));
+    bus_config.max_queued_messages = 32u;
+    bus_config.max_subscriptions = 16u;
+    bus_config.max_inflight_requests = 16u;
+    bus_config.max_transports = 1u;
+    ASSERT_STATUS(cd_bus_create(context, &bus_config, &bus), CD_STATUS_OK);
+    ASSERT_STATUS(cd_ipc_socket_transport_init(context, sockets[0], NULL, &transport), CD_STATUS_OK);
+    sockets[0] = -1;
+    ASSERT_STATUS(cd_bus_attach_transport(bus, &transport), CD_STATUS_OK);
+
+    memset(&publish, 0, sizeof(publish));
+    publish.source_endpoint = 10u;
+    publish.topic = 2401u;
+    publish.schema_id = 1u;
+    publish.schema_version = 1u;
+    publish.flags = 0u;
+    publish.payload = "proc-event";
+    publish.payload_size = strlen("proc-event");
+    ASSERT_STATUS(cd_publish(bus, &publish, NULL), CD_STATUS_OK);
+
+    memset(&request, 0, sizeof(request));
+    request.source_endpoint = 10u;
+    request.target_endpoint = 401u;
+    request.topic = 2402u;
+    request.schema_id = 2u;
+    request.schema_version = 1u;
+    request.flags = 0u;
+    request.timeout_ns = 2000000000ull;
+    request.payload = "proc-ask";
+    request.payload_size = strlen("proc-ask");
+    ASSERT_STATUS(cd_request_async(bus, &request, &token), CD_STATUS_OK);
+    ASSERT_TRUE(token != 0u);
+
+    for (i = 0; i < 4000; ++i) {
+        processed = 0u;
+        pump_status = cd_bus_pump(bus, 0u, &processed);
+        ASSERT_TRUE(
+            pump_status == CD_STATUS_OK || pump_status == CD_STATUS_TRANSPORT_UNAVAILABLE
+        );
+        poll_status = cd_poll_reply(bus, token, &reply, &ready);
+        if (poll_status == CD_STATUS_OK && ready == 1) {
+            break;
+        }
+        ASSERT_TRUE(poll_status == CD_STATUS_OK);
+        ASSERT_TRUE(ready == 0);
+        if (pump_status == CD_STATUS_TRANSPORT_UNAVAILABLE) {
+            break;
+        }
+        usleep(1000u);
+    }
+
+    ASSERT_TRUE(poll_status == CD_STATUS_OK);
+    ASSERT_TRUE(ready == 1);
+    ASSERT_TRUE(reply.payload != NULL);
+    ASSERT_TRUE(reply.payload_size == strlen("proc-ok"));
+    ASSERT_TRUE(strncmp((const char *)reply.payload, "proc-ok", reply.payload_size) == 0);
+    cd_reply_dispose(bus, &reply);
+
+    ASSERT_TRUE(waitpid(child_pid, &child_status, 0) == child_pid);
+    ASSERT_TRUE(WIFEXITED(child_status));
+    ASSERT_TRUE(WEXITSTATUS(child_status) == 0);
+
+    cd_ipc_socket_transport_close(&transport);
+    cd_bus_destroy(bus);
+    cd_context_shutdown(context);
+    return 0;
+}
+
 static int test_context_validation_edges(void)
 {
     cd_context_t *context;
@@ -1676,6 +1872,7 @@ int main(void)
     RUN_TEST(test_ipc_socket_transport_request_reply_between_buses);
     RUN_TEST(test_ipc_socket_transport_protocol_mismatch_path);
     RUN_TEST(test_ipc_socket_transport_disconnect_paths);
+    RUN_TEST(test_ipc_socket_transport_forked_two_process_roundtrip);
     RUN_TEST(test_ipc_codec_roundtrip);
     RUN_TEST(test_ipc_codec_validation_guards);
     RUN_TEST(test_queue_and_argument_edges);
